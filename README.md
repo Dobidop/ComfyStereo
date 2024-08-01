@@ -4,8 +4,8 @@ A very basic port of the stereoscopic script used in thygate/stable-diffusion-we
 
 Most of the credit goes to them, and most of the rest to some LLMs.
 
-The Stereo Image Node is a basic port from the Automatic1111 stereo script. In the current implementation it doesn't support image batches.
-The LazyStereo node is another very basic stereo image generator I created with help from LLMs. This node supports image batches.
+The Stereo Image Node is a basic port from the Automatic1111 stereo script
+The LazyStereo node is a naïve stereo image generator I created with the help from LLMs
 
 
 
