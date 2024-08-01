@@ -189,14 +189,14 @@ class LazyStereo:
                 "step": 1, #Slider's step
                 "display": "number" # Cosmetic only: display as "number" or "slider"
             }),
-            "mode": (["crosseye", "straight"],),
+            "mode": (["Cross-eyed", "Parallel"],),
             },
         }
 
     RETURN_TYPES = ("IMAGE",)
     FUNCTION = "generate_cross_eyed_image"
 
-    def generate_cross_eyed_image(self, image, depth_map, shift_amount=10, mode="crosseye"):
+    def generate_cross_eyed_image(self, image, depth_map, shift_amount=10, mode="Cross-eyed"):
         images = tensor2cv2(image)
         depth_maps = tensor2cv2(depth_map)
 
@@ -259,7 +259,7 @@ class LazyStereo:
             left_image = cv2.inpaint(left_image, left_mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
             right_image = cv2.inpaint(right_image, right_mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
 
-            if mode == "crosseye":
+            if mode == "Cross-eyed":
                 # Combine the left and right images side by side
                 cross_eyed_image = np.hstack((right_image, left_image))
             else:
