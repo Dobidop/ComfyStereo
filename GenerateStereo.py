@@ -52,43 +52,48 @@ class StereoImageNode:
 
     def generate(self, image, depth_map, divergence, separation, modes, 
                  stereo_balance, stereo_offset_exponent, fill_technique):
-                 
-        image_np = tensor2np(image)
-        depth_map_np = tensor2np(depth_map)
         
-        # Ensure depth_map is a single-channel grayscale image
-        if len(depth_map_np.shape) == 3 and depth_map_np.shape[2] == 3:
-            depth_map_np = np.dot(depth_map_np[..., :3], [0.2989, 0.5870, 0.1140]).astype(np.uint8)
+        results_final = []
+        for i in range(len(image)):
+            img = tensor2np(image[i:i+1])
+            dm = tensor2np(depth_map[i:i+1])
+
         
-        # Ensure both images are of the same size
-        if image_np.shape[:2] != depth_map_np.shape:
-            depth_map_np = np.array(Image.fromarray(depth_map_np).resize((image_np.shape[1], image_np.shape[0])))
+            # Ensure depth_map is a single-channel grayscale image
+            if len(dm.shape) == 3 and dm.shape[2] == 3:
+                dm = np.dot(dm[..., :3], [0.2989, 0.5870, 0.1140]).astype(np.uint8)
+            
+            # Ensure both images are of the same size
+            if img.shape[:2] != dm.shape:
+                dm = np.array(Image.fromarray(dm).resize((img.shape[1], img.shape[0])))
 
-        results = sig.create_stereoimages(image_np, depth_map_np, divergence, separation,  
-                                           [modes], stereo_balance, stereo_offset_exponent, fill_technique)
+            results = sig.create_stereoimages(img, dm, divergence, separation,  
+                                               [modes], stereo_balance, stereo_offset_exponent, fill_technique)
 
-        # Save the result for debugging
-        if isinstance(results, list):
-            for idx, result in enumerate(results):
-                result = np.array(result)
-                #Image.fromarray(result).save(f"debug_result_{idx}.png")
-        else:
-            results = np.array(results)
-            #Image.fromarray(results).save("debug_result.png")
+            # Save the result for debugging
+            if isinstance(results, list):
+                for idx, result in enumerate(results):
+                    result = np.array(result)
+                    #Image.fromarray(result).save(f"debug_result_{idx}.png")
+            else:
+                results = np.array(results)
+                #Image.fromarray(results).save("debug_result.png")
 
-        # Convert the result to a tensor
-        if isinstance(results, list):
-            results = np.array(results[0])
-        else:
-            results = np.array(results)
+            # Convert the result to a tensor
+            if isinstance(results, list):
+                results = np.array(results[0])
+            else:
+                results = np.array(results)
 
-        # Ensure the results are in the correct shape (H, W, C)
-        if len(results.shape) == 2:  # Convert grayscale to RGB
-            results = np.stack([results]*3, axis=-1)
+            # Ensure the results are in the correct shape (H, W, C)
+            if len(results.shape) == 2:  # Convert grayscale to RGB
+                results = np.stack([results]*3, axis=-1)
 
-        results_tensor = np2tensor(results)
+            results_tensor = np2tensor(results)
+            
+            results_final.append(results_tensor)
 
-        return (results_tensor,)
+        return (torch.cat(results_final),)
 
 
 
