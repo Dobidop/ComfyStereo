@@ -43,7 +43,7 @@ class StereoImageNode:
                 "divergence": ("FLOAT", {"default": 2.5, "min": 0.05, "max": 15, "step": 0.01}), 
                 "separation": ("FLOAT", {"default": 0, "min": -5, "max": 5, "step": 0.01}),
                 "stereo_balance": ("FLOAT", {"default": 0, "min": -0.95, "max": 0.95, "step": 0.05}),
-                "stereo_offset_exponent": ("FLOAT", {"default": 2, "min": 2, "max": 2, "step": 1})
+                "stereo_offset_exponent": ("FLOAT", {"default": 2, "min": 1, "max": 2, "step": 1})
             }
         }
     
