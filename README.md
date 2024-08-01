@@ -5,7 +5,7 @@ A very basic port of the stereoscopic script used in thygate/stable-diffusion-we
 Most of the credit goes to them, and most of the rest to some LLMs.
 
 The Stereo Image Node is a basic port from the Automatic1111 stereo script. In the current implementation it doesn't support image batches.
-The LazyStereo node is another very basic stereo image generator. This node supports image batches.
+The LazyStereo node is another very basic stereo image generator I created with help from LLMs. This node supports image batches.
 
 
 
@@ -15,7 +15,7 @@ To install the these nodes, clone this repository and add it to custom_nodes fol
 git clone https://github.com/Dobidop/ComfyStereo.git
 pip install -r requirements.txt
 ```
-or, download the files manually fromt he repo and put them in the 'ComfyUI\custom_nodes' folder
+or, download the files manually from the repo and put them in the 'ComfyUI\custom_nodes' folder
 
 # Example workflow
 
