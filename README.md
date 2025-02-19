@@ -7,7 +7,7 @@ Most of the credit goes to them, and most of the rest to some LLMs.
 https://github.com/user-attachments/assets/b76e6243-557b-454b-9baa-1aac2a7eb22a
 
 
-Added some new functionaltiy such as edge and direction aware blur of the depth map. I've also managed to add some additional interpolation and stereo distortion methods. By 'I', I mean I tortured ChatGPT for hours.
+Added some new functionality such as edge and direction aware blur of the depth map. I've also managed to add some additional interpolation and stereo distortion methods. By 'I', I mean I tortured ChatGPT for hours.
 
 #### Things to note
 To activate the adaptive blurring, set 'depth_blur_sigma' (the amount of blur applied) to a value greater than 0.
