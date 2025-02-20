@@ -1,6 +1,6 @@
 [project]
 name = "comfystereo"
-description = "A node for stereoscopic image generation (sid-by-side, cross-eyed, cyan-side-by-side etc.) Nodes: Stereo Image Node - a basic port from the Automatic1111 stereo script, and additional modifications such as edge and direction aware blurring of depth map"
+description = "A nodes for stereoscopic image generation. Nodes: Stereo Image Node - a basic port from the Automatic1111 stereo script, and additional modifications such as edge and direction aware blurring of depth map"
 version = "1.0.0"
 license = {file = "LICENSE"}
 dependencies = ["torch", "numpy", "Pillow", "opencv-python"]
