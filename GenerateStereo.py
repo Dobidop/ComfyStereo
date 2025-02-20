@@ -39,131 +39,72 @@ class StereoImageNode:
                 "image": ("IMAGE",),
                 "depth_map": ("IMAGE",),
                 "modes": (["left-right", "right-left", "top-bottom", "bottom-top", "red-cyan-anaglyph"],),
-                "fill_technique": ([
-                    'No fill', 'No fill - Reverse projection', 'Imperfect fill - Hybrid Edge', 'Fill - Naive',
-                    'Fill - Naive interpolating', 'Fill - Polylines Soft', 'Fill - Polylines Sharp',
-                    'Fill - Post-fill', 'Fill - Reverse projection with Post-fill', 'Fill - Hybrid Edge with fill'
-                ], {"default": "Fill - Polylines Soft"}),
-                #"return_basic_mask": ("BOOLEAN", {"default": False}),
+                "fill_technique": (['none', 'naive', 'naive_interpolating', 'polylines_soft','polylines_sharp'],),
             },
             "optional": {
-                "divergence": ("FLOAT", {"default": 3.5, "min": 0.05, "max": 15, "step": 0.01}), 
+                "divergence": ("FLOAT", {"default": 2.5, "min": 0.05, "max": 15, "step": 0.01}), 
                 "separation": ("FLOAT", {"default": 0, "min": -5, "max": 5, "step": 0.01}),
                 "stereo_balance": ("FLOAT", {"default": 0, "min": -0.95, "max": 0.95, "step": 0.05}),
-                "stereo_offset_exponent": ("FLOAT", {"default": 2, "min": 1, "max": 2, "step": 1}),
-                "depth_blur_sigma": ("FLOAT", {"default": 0, "min": 0, "max": 10, "step": 0.1}),
-                "depth_blur_edge_threshold": ("FLOAT", {"default": 40, "min": 0.1, "max": 100, "step": 0.1})
+                "stereo_offset_exponent": ("FLOAT", {"default": 2, "min": 1, "max": 2, "step": 1})
             }
         }
     
-    RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", "MASK")
-    RETURN_NAMES = ("stereoscope", "modified_depthmap_left", "modified_depthmap_right", "no_fill_imperfect_mask")
+    RETURN_TYPES = ("IMAGE",) 
     FUNCTION = "generate"
 
     def generate(self, image, depth_map, divergence, separation, modes, 
-                 stereo_balance, stereo_offset_exponent, fill_technique, depth_blur_sigma, depth_blur_edge_threshold):# return_basic_mask):
+                 stereo_balance, stereo_offset_exponent, fill_technique):
         
-        fill_technique_mapping = {
-            'No fill': 'none',
-            'No fill - Reverse projection': 'inverse',
-            'Imperfect fill - Hybrid Edge': 'hybrid_edge',
-            'Fill - Naive': 'naive',
-            'Fill - Naive interpolating': 'naive_interpolating',
-            'Fill - Polylines Soft': 'polylines_soft',
-            'Fill - Polylines Sharp': 'polylines_sharp',
-            'Fill - Post-fill': 'none_post',
-            'Fill - Reverse projection with Post-fill': 'inverse_post',
-            'Fill - Hybrid Edge with fill': 'hybrid_edge_plus'
-        }
-        
-        fill_technique = fill_technique_mapping.get(fill_technique, 'none')
-          
         results_final = []
-        modified_depthmap_final_left = []
-        modified_depthmap_final_right = []
-        mask_final = []
-        total_steps = len(image)
-        pbar = ProgressBar(total_steps)
+        total_steps = len(image)  # Total number of images to process
+        pbar = ProgressBar(total_steps)  # Initialize progress bar
+        
         
         for i in range(len(image)):
             img = tensor2np(image[i:i+1])
             dm = tensor2np(depth_map[i:i+1])
+
         
+            # Ensure depth_map is a single-channel grayscale image
             if len(dm.shape) == 3 and dm.shape[2] == 3:
                 dm = np.dot(dm[..., :3], [0.2989, 0.5870, 0.1140]).astype(np.uint8)
             
+            # Ensure both images are of the same size
             if img.shape[:2] != dm.shape:
                 dm = np.array(Image.fromarray(dm).resize((img.shape[1], img.shape[0])))
-            
-            output = sig.create_stereoimages(img, dm, divergence, separation,  
-                                             [modes], stereo_balance, stereo_offset_exponent, 
-                                             fill_technique, depth_blur_sigma, depth_blur_edge_threshold)
-            
-            # if return_basic_mask = True:
-                # if fill_technique in ['polylines_sharp','polylines_sharp','naive','naive_interpolating']:
-                    # output_mask = sig.create_stereoimages(img, dm, divergence, separation,  
-                                                     # [modes], stereo_balance, stereo_offset_exponent, 
-                                                     # 'none', depth_blur_sigma, depth_blur_edge_threshold)
-                    # mask = self.generate_mask(output_mask)
-                    # mask_final.append(mask)
-               
-               # if fill_technique in ['polylines_sharp','polylines_sharp','naive','naive_interpolating']:
-                   
-               
-               
-                    
-            
-            if len(output) == 3:
-                results, left_modified_depthmap, right_modified_depthmap = output
+
+            results = sig.create_stereoimages(img, dm, divergence, separation,  
+                                               [modes], stereo_balance, stereo_offset_exponent, fill_technique)
+
+            # Save the result for debugging
+            if isinstance(results, list):
+                for idx, result in enumerate(results):
+                    result = np.array(result)
+                    #Image.fromarray(result).save(f"debug_result_{idx}.png")
             else:
-                results, modified_depthmap = output
-                left_modified_depthmap = modified_depthmap
-                right_modified_depthmap = modified_depthmap
+                results = np.array(results)
+                #Image.fromarray(results).save("debug_result.png")
+
+            # Convert the result to a tensor
+            if isinstance(results, list):
+                results = np.array(results[0])
+            else:
+                results = np.array(results)
+
+            # Ensure the results are in the correct shape (H, W, C)
+            if len(results.shape) == 2:  # Convert grayscale to RGB
+                results = np.stack([results]*3, axis=-1)
+
+            results_tensor = np2tensor(results)
             
-            results_final.append(convertResult(results))
-            modified_depthmap_final_left.append(convertResult(left_modified_depthmap))
-            modified_depthmap_final_right.append(convertResult(right_modified_depthmap))
-            
-            mask = self.generate_mask(results)
-            mask_final.append(mask)
+            results_final.append(results_tensor)
             
             pbar.update(1)
         
-        return (torch.cat(results_final), torch.cat(modified_depthmap_final_left), torch.cat(modified_depthmap_final_right), torch.cat(mask_final))
-
-    def generate_mask(self, stereoscope_img):
-        np_img = np.array(stereoscope_img)
-        mask = (np_img.sum(axis=-1) == 0).astype(np.uint8) * 255  # Black areas become white in mask
-        return np2tensor(mask)
+        return (torch.cat(results_final),)
 
 
 
-def convertResult(results):
-    # Save the result for debugging
-    if isinstance(results, list):
-        for idx, result in enumerate(results):
-            result = np.array(result)
-            #Image.fromarray(result).save(f"debug_result_{idx}.png")
-    else:
-        results = np.array(results)
-        #Image.fromarray(results).save("debug_result.png")
-
-    # Convert the result to a tensor
-    if isinstance(results, list):
-        results = np.array(results[0])
-    else:
-        results = np.array(results)
-
-    # Ensure the results are in the correct shape (H, W, C)
-    if len(results.shape) == 2:  # Convert grayscale to RGB
-        results = np.stack([results]*3, axis=-1)
-
-    results_tensor = np2tensor(results)
-    
-    return results_tensor
-    
-    
-    
 
 def tensor2cv2(image: torch.Tensor) -> List[tuple[np.ndarray, tuple]]:
     original_shape = image.shape
