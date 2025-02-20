@@ -15,8 +15,6 @@ sys.path.append(file_dir)
 
 import stereoimage_generation as sig
 
-from comfy.utils import ProgressBar
-
 def tensor2np(tensor: torch.Tensor) -> np.ndarray:
     if tensor.dim() == 4:  # Batch of images
         tensor = tensor[0]  # Assuming we take the first image in the batch
@@ -39,15 +37,10 @@ class StereoImageNode:
                 "image": ("IMAGE",),
                 "depth_map": ("IMAGE",),
                 "modes": (["left-right", "right-left", "top-bottom", "bottom-top", "red-cyan-anaglyph"],),
-                "fill_technique": ([
-                    'No fill', 'No fill - Reverse projection', 'Imperfect fill - Hybrid Edge', 'Fill - Naive',
-                    'Fill - Naive interpolating', 'Fill - Polylines Soft', 'Fill - Polylines Sharp',
-                    'Fill - Post-fill', 'Fill - Reverse projection with Post-fill', 'Fill - Hybrid Edge with fill'
-                ], {"default": "Fill - Polylines Soft"}),
-                #"return_basic_mask": ("BOOLEAN", {"default": False}),
+                "fill_technique": (['none', 'naive', 'naive_interpolating', 'polylines_soft','polylines_sharp'],),
             },
             "optional": {
-                "divergence": ("FLOAT", {"default": 3.5, "min": 0.05, "max": 15, "step": 0.01}), 
+                "divergence": ("FLOAT", {"default": 2.5, "min": 0.05, "max": 15, "step": 0.01}), 
                 "separation": ("FLOAT", {"default": 0, "min": -5, "max": 5, "step": 0.01}),
                 "stereo_balance": ("FLOAT", {"default": 0, "min": -0.95, "max": 0.95, "step": 0.05}),
                 "stereo_offset_exponent": ("FLOAT", {"default": 2, "min": 1, "max": 2, "step": 1}),
@@ -56,114 +49,55 @@ class StereoImageNode:
             }
         }
     
-    RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", "MASK")
-    RETURN_NAMES = ("stereoscope", "modified_depthmap_left", "modified_depthmap_right", "no_fill_imperfect_mask")
+    RETURN_TYPES = ("IMAGE",) 
     FUNCTION = "generate"
 
+    # Added depth_blur_sigma and depth_blur_edge_threshold parameters:
     def generate(self, image, depth_map, divergence, separation, modes, 
-                 stereo_balance, stereo_offset_exponent, fill_technique, depth_blur_sigma, depth_blur_edge_threshold):# return_basic_mask):
+                 stereo_balance, stereo_offset_exponent, fill_technique, depth_blur_sigma, depth_blur_edge_threshold):
         
-        fill_technique_mapping = {
-            'No fill': 'none',
-            'No fill - Reverse projection': 'inverse',
-            'Imperfect fill - Hybrid Edge': 'hybrid_edge',
-            'Fill - Naive': 'naive',
-            'Fill - Naive interpolating': 'naive_interpolating',
-            'Fill - Polylines Soft': 'polylines_soft',
-            'Fill - Polylines Sharp': 'polylines_sharp',
-            'Fill - Post-fill': 'none_post',
-            'Fill - Reverse projection with Post-fill': 'inverse_post',
-            'Fill - Hybrid Edge with fill': 'hybrid_edge_plus'
-        }
-        
-        fill_technique = fill_technique_mapping.get(fill_technique, 'none')
-          
         results_final = []
-        modified_depthmap_final_left = []
-        modified_depthmap_final_right = []
-        mask_final = []
-        total_steps = len(image)
-        pbar = ProgressBar(total_steps)
-        
         for i in range(len(image)):
             img = tensor2np(image[i:i+1])
             dm = tensor2np(depth_map[i:i+1])
-        
+
+            # Ensure depth_map is a single-channel grayscale image
             if len(dm.shape) == 3 and dm.shape[2] == 3:
                 dm = np.dot(dm[..., :3], [0.2989, 0.5870, 0.1140]).astype(np.uint8)
             
+            # Ensure both images are of the same size
             if img.shape[:2] != dm.shape:
                 dm = np.array(Image.fromarray(dm).resize((img.shape[1], img.shape[0])))
-            
-            output = sig.create_stereoimages(img, dm, divergence, separation,  
-                                             [modes], stereo_balance, stereo_offset_exponent, 
-                                             fill_technique, depth_blur_sigma, depth_blur_edge_threshold)
-            
-            # if return_basic_mask = True:
-                # if fill_technique in ['polylines_sharp','polylines_sharp','naive','naive_interpolating']:
-                    # output_mask = sig.create_stereoimages(img, dm, divergence, separation,  
-                                                     # [modes], stereo_balance, stereo_offset_exponent, 
-                                                     # 'none', depth_blur_sigma, depth_blur_edge_threshold)
-                    # mask = self.generate_mask(output_mask)
-                    # mask_final.append(mask)
-               
-               # if fill_technique in ['polylines_sharp','polylines_sharp','naive','naive_interpolating']:
-                   
-               
-               
-                    
-            
-            if len(output) == 3:
-                results, left_modified_depthmap, right_modified_depthmap = output
+
+            # Pass the depth blur parameters to sig.create_stereoimages
+            results = sig.create_stereoimages(img, dm, divergence, separation,  
+                                               [modes], stereo_balance, stereo_offset_exponent, 
+                                               fill_technique, depth_blur_sigma, depth_blur_edge_threshold)
+
+            # Save the result for debugging
+            if isinstance(results, list):
+                for idx, result in enumerate(results):
+                    result = np.array(result)
+                    #Image.fromarray(result).save(f"debug_result_{idx}.png")
             else:
-                results, modified_depthmap = output
-                left_modified_depthmap = modified_depthmap
-                right_modified_depthmap = modified_depthmap
+                results = np.array(results)
+                #Image.fromarray(results).save("debug_result.png")
+
+            # Convert the result to a tensor
+            if isinstance(results, list):
+                results = np.array(results[0])
+            else:
+                results = np.array(results)
+
+            # Ensure the results are in the correct shape (H, W, C)
+            if len(results.shape) == 2:  # Convert grayscale to RGB
+                results = np.stack([results]*3, axis=-1)
+
+            results_tensor = np2tensor(results)
             
-            results_final.append(convertResult(results))
-            modified_depthmap_final_left.append(convertResult(left_modified_depthmap))
-            modified_depthmap_final_right.append(convertResult(right_modified_depthmap))
-            
-            mask = self.generate_mask(results)
-            mask_final.append(mask)
-            
-            pbar.update(1)
-        
-        return (torch.cat(results_final), torch.cat(modified_depthmap_final_left), torch.cat(modified_depthmap_final_right), torch.cat(mask_final))
+            results_final.append(results_tensor)
 
-    def generate_mask(self, stereoscope_img):
-        np_img = np.array(stereoscope_img)
-        mask = (np_img.sum(axis=-1) == 0).astype(np.uint8) * 255  # Black areas become white in mask
-        return np2tensor(mask)
-
-
-
-def convertResult(results):
-    # Save the result for debugging
-    if isinstance(results, list):
-        for idx, result in enumerate(results):
-            result = np.array(result)
-            #Image.fromarray(result).save(f"debug_result_{idx}.png")
-    else:
-        results = np.array(results)
-        #Image.fromarray(results).save("debug_result.png")
-
-    # Convert the result to a tensor
-    if isinstance(results, list):
-        results = np.array(results[0])
-    else:
-        results = np.array(results)
-
-    # Ensure the results are in the correct shape (H, W, C)
-    if len(results.shape) == 2:  # Convert grayscale to RGB
-        results = np.stack([results]*3, axis=-1)
-
-    results_tensor = np2tensor(results)
-    
-    return results_tensor
-    
-    
-    
+        return (torch.cat(results_final),)
 
 def tensor2cv2(image: torch.Tensor) -> List[tuple[np.ndarray, tuple]]:
     original_shape = image.shape
@@ -243,121 +177,118 @@ def pil2tensor(image):
 def tensor2pil(image):
     return Image.fromarray(np.clip(255. * image.cpu().numpy().squeeze(), 0, 255).astype(np.uint8))
 
-# class LazyStereo:
-    # @classmethod
-    # def INPUT_TYPES(s):
-        # return {"required": {
-            # "image": ("IMAGE",),
-            # "depth_map": ("IMAGE",),
-            # "shift_amount": ("INT", {
-                # "default": 10, 
-                # "min": 5, #Minimum value
-                # "max": 200, #Maximum value
-                # "step": 1, #Slider's step
-                # "display": "number" # Cosmetic only: display as "number" or "slider"
-            # }),
-            # "mode": (["Cross-eyed", "Parallel"],),
-            # },
-        # }
+class LazyStereo:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "image": ("IMAGE",),
+            "depth_map": ("IMAGE",),
+            "shift_amount": ("INT", {
+                "default": 10, 
+                "min": 5, #Minimum value
+                "max": 200, #Maximum value
+                "step": 1, #Slider's step
+                "display": "number" # Cosmetic only: display as "number" or "slider"
+            }),
+            "mode": (["Cross-eyed", "Parallel"],),
+            },
+        }
 
-    # RETURN_TYPES = ("IMAGE",)
-    # FUNCTION = "generate_cross_eyed_image"
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "generate_cross_eyed_image"
 
-    # def generate_cross_eyed_image(self, image, depth_map, shift_amount=10, mode="Cross-eyed"):
-        # images = tensor2cv2(image)
-        # depth_maps = tensor2cv2(depth_map)
+    def generate_cross_eyed_image(self, image, depth_map, shift_amount=10, mode="Cross-eyed"):
+        images = tensor2cv2(image)
+        depth_maps = tensor2cv2(depth_map)
 
-        # results = []
-        # total_steps = len(image)  # Total number of images to process
-        # pbar = ProgressBar(total_steps)
+        results = []
 
-        # for (img, original_img_shape), (depth_map, original_depth_shape) in zip(images, depth_maps):
-            # if len(depth_map.shape) == 3 and depth_map.shape[2] > 1:
-                # depth_map = cv2.cvtColor(depth_map, cv2.COLOR_BGR2GRAY)
-            # elif len(depth_map.shape) == 2:
-                # # It's already grayscale, no need to convert
-                # pass
-            # else:
-                # raise ValueError(f"Unexpected depth map shape: {depth_map.shape}")
+        for (img, original_img_shape), (depth_map, original_depth_shape) in zip(images, depth_maps):
+            if len(depth_map.shape) == 3 and depth_map.shape[2] > 1:
+                depth_map = cv2.cvtColor(depth_map, cv2.COLOR_BGR2GRAY)
+            elif len(depth_map.shape) == 2:
+                # It's already grayscale, no need to convert
+                pass
+            else:
+                raise ValueError(f"Unexpected depth map shape: {depth_map.shape}")
 
-            # if img is None or depth_map is None:
-                # raise ValueError("Image or depth map not found.")
+            if img is None or depth_map is None:
+                raise ValueError("Image or depth map not found.")
 
-            # height, width = img.shape[:2]
+            height, width = img.shape[:2]
 
-            # # Calculate gradients to determine high-contrast regions
-            # grad_x = cv2.Sobel(depth_map, cv2.CV_64F, 1, 0, ksize=3)
-            # grad_y = cv2.Sobel(depth_map, cv2.CV_64F, 0, 1, ksize=3)
-            # gradient_magnitude = np.sqrt(grad_x**2 + grad_y**2)
-            # max_gradient = np.max(gradient_magnitude)
-            # gradient_magnitude = gradient_magnitude / max_gradient  # Normalize to [0, 1]
+            # Calculate gradients to determine high-contrast regions
+            grad_x = cv2.Sobel(depth_map, cv2.CV_64F, 1, 0, ksize=3)
+            grad_y = cv2.Sobel(depth_map, cv2.CV_64F, 0, 1, ksize=3)
+            gradient_magnitude = np.sqrt(grad_x**2 + grad_y**2)
+            max_gradient = np.max(gradient_magnitude)
+            gradient_magnitude = gradient_magnitude / max_gradient  # Normalize to [0, 1]
 
-            # # Initialize the left and right images and masks for inpainting
-            # left_image = np.zeros_like(img)
-            # right_image = np.zeros_like(img)
-            # left_mask = np.zeros((height, width), dtype=np.uint8)
-            # right_mask = np.zeros((height, width), dtype=np.uint8)
+            # Initialize the left and right images and masks for inpainting
+            left_image = np.zeros_like(img)
+            right_image = np.zeros_like(img)
+            left_mask = np.zeros((height, width), dtype=np.uint8)
+            right_mask = np.zeros((height, width), dtype=np.uint8)
 
-            # # Generate the left and right images by shifting pixels according to the depth map
-            # for y in range(height):
-                # for x in range(width):
-                    # depth = depth_map[y, x]
-                    # local_gradient = gradient_magnitude[y, x]
-                    # adaptive_shift = shift_amount * (1 - local_gradient)  # Reduce shift in high-contrast areas
-                    # shift = int((depth / 255.0) * adaptive_shift)
-                    # if x - shift >= 0:
-                        # left_image[y, x] = img[y, x - shift]
-                    # else:
-                        # left_image[y, x] = img[y, 0]
-                    # if x + shift < width:
-                        # right_image[y, x] = img[y, x + shift]
-                    # else:
-                        # right_image[y, x] = img[y, width - 1]
+            # Generate the left and right images by shifting pixels according to the depth map
+            for y in range(height):
+                for x in range(width):
+                    depth = depth_map[y, x]
+                    local_gradient = gradient_magnitude[y, x]
+                    adaptive_shift = shift_amount * (1 - local_gradient)  # Reduce shift in high-contrast areas
+                    shift = int((depth / 255.0) * adaptive_shift)
+                    if x - shift >= 0:
+                        left_image[y, x] = img[y, x - shift]
+                    else:
+                        left_image[y, x] = img[y, 0]
+                    if x + shift < width:
+                        right_image[y, x] = img[y, x + shift]
+                    else:
+                        right_image[y, x] = img[y, width - 1]
 
-                    # # Update masks for inpainting
-                    # if x - shift < 0 or x + shift >= width:
-                        # left_mask[y, x] = 255
-                        # right_mask[y, x] = 255
+                    # Update masks for inpainting
+                    if x - shift < 0 or x + shift >= width:
+                        left_mask[y, x] = 255
+                        right_mask[y, x] = 255
 
-            # # Apply edge detection to create a more precise inpainting mask
-            # edges = cv2.Canny(depth_map, 100, 200)
-            # left_mask = cv2.bitwise_or(left_mask, edges)
-            # right_mask = cv2.bitwise_or(right_mask, edges)
+            # Apply edge detection to create a more precise inpainting mask
+            edges = cv2.Canny(depth_map, 100, 200)
+            left_mask = cv2.bitwise_or(left_mask, edges)
+            right_mask = cv2.bitwise_or(right_mask, edges)
 
-            # # Inpaint the left and right images to fill in gaps
-            # left_image = cv2.inpaint(left_image, left_mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
-            # right_image = cv2.inpaint(right_image, right_mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
+            # Inpaint the left and right images to fill in gaps
+            left_image = cv2.inpaint(left_image, left_mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
+            right_image = cv2.inpaint(right_image, right_mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
 
-            # if mode == "Cross-eyed":
-                # # Combine the left and right images side by side
-                # cross_eyed_image = np.hstack((right_image, left_image))
-            # else:
-                # cross_eyed_image = np.hstack((left_image, right_image))
+            if mode == "Cross-eyed":
+                # Combine the left and right images side by side
+                cross_eyed_image = np.hstack((right_image, left_image))
+            else:
+                cross_eyed_image = np.hstack((left_image, right_image))
 
-            # # Separate the channels
-            # red_channel = cross_eyed_image[:, :, 0]
-            # green_channel = cross_eyed_image[:, :, 1]
-            # blue_channel = cross_eyed_image[:, :, 2]
+            # Separate the channels
+            red_channel = cross_eyed_image[:, :, 0]
+            green_channel = cross_eyed_image[:, :, 1]
+            blue_channel = cross_eyed_image[:, :, 2]
 
-            # # Convert channels back to tensors
-            # red_tensor = cv22tensor([(red_channel, (1, 1, height, width))])
-            # green_tensor = cv22tensor([(green_channel, (1, 1, height, width))])
-            # blue_tensor = cv22tensor([(blue_channel, (1, 1, height, width))])
+            # Convert channels back to tensors
+            red_tensor = cv22tensor([(red_channel, (1, 1, height, width))])
+            green_tensor = cv22tensor([(green_channel, (1, 1, height, width))])
+            blue_tensor = cv22tensor([(blue_channel, (1, 1, height, width))])
 
-            # merged_image = merge_channels(blue_tensor, green_tensor, red_tensor)
+            merged_image = merge_channels(blue_tensor, green_tensor, red_tensor)
 
-            # results.append(merged_image[0])
-            # pbar.update(1)
+            results.append(merged_image[0])
 
-        # # Concatenate the results into a single tensor
-        # return (torch.cat(results),)
+        # Concatenate the results into a single tensor
+        return (torch.cat(results),)
 
 NODE_CLASS_MAPPINGS = {
-#    "LazyStereo": LazyStereo,
+    "LazyStereo": LazyStereo,
     "StereoImageNode": StereoImageNode
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-#    "LazyStereo": "LazyStereo",
+    "LazyStereo": "LazyStereo",
     "StereoImageNode": "Stereo Image Node"
 }
