@@ -1,6 +1,6 @@
 [project]
 name = "comfystereo"
-description = "Two simple nodes for stereoscopic image generation. Nodes: Stereo Image Node - a basic port from the Automatic1111 stereo script in thygate/stable-diffusion-webui-depthmap-script, LazyStereo - a naïve stereo image generator"
+description = "A simple node for stereoscopic image generation. Nodes: Stereo Image Node - a basic port from the Automatic1111 stereo script with som extra features added, such as edge and direction aware blurring of the depth map"
 version = "1.0.0"
 license = {file = "LICENSE"}
 dependencies = ["torch", "numpy", "Pillow", "opencv-python"]
