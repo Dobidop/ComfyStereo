@@ -227,6 +227,7 @@ def pil2tensor(image):
 def tensor2pil(image):
     return Image.fromarray(np.clip(255. * image.cpu().numpy().squeeze(), 0, 255).astype(np.uint8))
 
+
 # class LazyStereo:
     # @classmethod
     # def INPUT_TYPES(s):
