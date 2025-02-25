@@ -40,7 +40,7 @@ class DeoVRLauncher:
     def load_deovr_path(self):
         """Loads the DeoVR installation path from a config file."""
         if not os.path.exists(self.config_path):
-            print(f"❌ Config file not found: {self.config_path}")
+            print(f"X  Config file not found: {self.config_path}")
             return None
 
         try:
@@ -48,16 +48,16 @@ class DeoVRLauncher:
                 config = json.load(f)
                 return config.get("deovr_path", None)
         except Exception as e:
-            print(f"❌ Error reading config file: {e}")
+            print(f"X  Error reading config file: {e}")
             return None
 
     def is_deovr_running(self):
         """Checks if DeoVR.exe is currently running."""
         for process in psutil.process_iter(attrs=['name']):
             if process.info['name'].lower() == "deovr.exe":
-                print("✅ DeoVR is already running.")
+                #print("OK!  DeoVR is already running.")
                 return True
-        print("ℹ️ DeoVR is not running.")
+        print("!  DeoVR is not running.")
         return False
 
     def create_dummy_image(self, temp_folder):
@@ -70,36 +70,46 @@ class DeoVRLauncher:
         try:
             img = Image.new("RGB", (1920, 1080), (0, 0, 0))  # Black image
             img.save(dummy_path)
-            print(f"✅ Created dummy image: {dummy_path}")
+            print(f"OK!  Created dummy image: {dummy_path}")
             return dummy_path
         except Exception as e:
-            print(f"❌ Error creating dummy image: {e}")
+            print(f"X  Error creating dummy image: {e}")
             return None
 
     def launch_deovr(self):
         """Launches DeoVR with the dummy image if it's not already running."""
         if self.is_deovr_running():
-            print("⚠️ DeoVR is already running. No need to launch.")
+            print("OK!  DeoVR is already running. No need to launch.")
             return
 
         if not self.deovr_path:
-            print("❌ DeoVR path is not set. Check the config file.")
+            print("XX  DeoVR path is not set. Check the config file.")
             return
+            
+        if not os.path.exists(self.deovr_path):
+            print(" ")
+            print(" ")
+            print(f"XXX  DeoVR path seems to be incorrect, file not found: {self.deovr_path}")
+            print(f"XXX  Update the config file in ComfyUI\custom_nodes\comfystereo\config.json to point to your DeoVR.exe file to autostart it when triggering this node.")
+            print(f"!!!  You can still use this node though. Start DeoVR manually, then open any image, then this node can pass an image/video to it.")
+            print(" ")
+            print(" ")
+            return None
 
         script_directory = os.path.dirname(os.path.abspath(__file__))
         loading_image_path = os.path.join(script_directory, 'loading_sbs_flat.png')
 
         try:
             subprocess.Popen([self.deovr_path, loading_image_path], shell=True)
-            print(f"🚀 Launched DeoVR...")
-            print(f"Waiting for DeoVR to start...")
+            print(f"! Launched DeoVR...")
+            print(f" Waiting for DeoVR to start...")
             time.sleep(5)
-            print(f"Still waiting for DeoVR to start... heat death of the universe approaching...")
+            print(f" Still waiting for DeoVR to start... heat death of the universe approaching...")
             time.sleep(5)
-            print(f"DeoVR... Any moment now... Soon™")
+            print(f" DeoVR... Any moment now... Soon™")
             time.sleep(5)
         except Exception as e:
-            print(f"❌ Error launching DeoVR: {e}")
+            print(f"XXX  Error launching DeoVR: {e}")
 
 
 class DeoVRViewNode:
