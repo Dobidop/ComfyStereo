@@ -1,7 +1,7 @@
 [project]
 name = "comfystereo"
-description = "A simple node for stereoscopic image generation. Nodes: Stereo Image Node - a basic port from the Automatic1111 stereo script with som extra features added, such as edge and direction aware blurring of the depth map"
-version = "1.0.1"
+description = "A simple node for stereoscopic image generation. Nodes: Stereo Image Node - a basic port from the Automatic1111 stereo script with som extra features added, such as edge and direction aware blurring of the depth map. DeoVR View - Sends images/videos to DeoVR. See readme for more details and setup of autostart of DeoVR"
+version = "1.1.0"
 license = {file = "LICENSE"}
 dependencies = ["torch", "numpy", "Pillow", "opencv-python"]
 
