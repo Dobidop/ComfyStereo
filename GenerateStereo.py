@@ -17,6 +17,213 @@ import stereoimage_generation as sig
 
 from comfy.utils import ProgressBar
 
+import socket
+import json
+import io
+import base64
+
+import os
+import socket
+import json
+import hashlib
+import shutil
+
+import subprocess
+import psutil
+import time
+
+class DeoVRLauncher:
+    def __init__(self, config_path):
+        self.config_path = config_path
+        self.deovr_path = self.load_deovr_path()
+
+    def load_deovr_path(self):
+        """Loads the DeoVR installation path from a config file."""
+        if not os.path.exists(self.config_path):
+            print(f"❌ Config file not found: {self.config_path}")
+            return None
+
+        try:
+            with open(self.config_path, "r") as f:
+                config = json.load(f)
+                return config.get("deovr_path", None)
+        except Exception as e:
+            print(f"❌ Error reading config file: {e}")
+            return None
+
+    def is_deovr_running(self):
+        """Checks if DeoVR.exe is currently running."""
+        for process in psutil.process_iter(attrs=['name']):
+            if process.info['name'].lower() == "deovr.exe":
+                print("✅ DeoVR is already running.")
+                return True
+        print("ℹ️ DeoVR is not running.")
+        return False
+
+    def create_dummy_image(self, temp_folder):
+        """Creates a black dummy image in the temp folder."""
+        dummy_path = os.path.join(temp_folder, "dummy.png")
+
+        if not os.path.exists(temp_folder):
+            os.makedirs(temp_folder)
+
+        try:
+            img = Image.new("RGB", (1920, 1080), (0, 0, 0))  # Black image
+            img.save(dummy_path)
+            print(f"✅ Created dummy image: {dummy_path}")
+            return dummy_path
+        except Exception as e:
+            print(f"❌ Error creating dummy image: {e}")
+            return None
+
+    def launch_deovr(self):
+        """Launches DeoVR with the dummy image if it's not already running."""
+        if self.is_deovr_running():
+            print("⚠️ DeoVR is already running. No need to launch.")
+            return
+
+        if not self.deovr_path:
+            print("❌ DeoVR path is not set. Check the config file.")
+            return
+
+        script_directory = os.path.dirname(os.path.abspath(__file__))
+        loading_image_path = os.path.join(script_directory, 'loading_sbs_flat.png')
+
+        try:
+            subprocess.Popen([self.deovr_path, loading_image_path], shell=True)
+            print(f"🚀 Launched DeoVR...")
+            print(f"Waiting for DeoVR to start...")
+            time.sleep(5)
+            print(f"Still waiting for DeoVR to start... heat death of the universe approaching...")
+            time.sleep(5)
+            print(f"DeoVR... Any moment now... Soon™")
+            time.sleep(5)
+        except Exception as e:
+            print(f"❌ Error launching DeoVR: {e}")
+
+
+class DeoVRViewNode:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "file_path": ("STRING", {"forceInput": True}),  # User-provided file or video path
+                "projection_type": ([
+                    "Flat 2D plane",
+                    "Equirectangular - 180° FOV",
+                    "Equirectangular - 360° FOV",
+                    "Fisheye projection - 180° FOV",
+                    "Fisheye projection - 190° FOV",
+                    "Fisheye projection - 200° FOV with MKX lens correction",
+                    "Fisheye projection - 220° FOV with VRCA lens correction"
+                ],),
+                "eye_location": (["Side-by-Side", "Top-Bottom"],),
+            }
+        }
+
+    RETURN_TYPES = ()
+    FUNCTION = "send_path_to_deovr"
+    CATEGORY = "Output"
+    OUTPUT_NODE = True
+
+    def send_path_to_deovr(self, file_path, projection_type, eye_location):
+        """
+        Copies the file to ComfyUI's temp folder with a modified name based on the projection type and eye location.
+        A unique MD5 hash is computed for the file to ensure uniqueness. If the file has been copied before,
+        the existing copy is reused. The command is then sent to DeoVR with the new file path.
+        """
+        config_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "./config.json"))
+        launcher = DeoVRLauncher(config_path)
+        launcher.launch_deovr()
+        
+        
+        if not os.path.exists(file_path):
+            print(f"Error: The specified file does not exist: {file_path}")
+            return ()
+
+        # Define the temp folder relative to ComfyUI (two levels up)
+        temp_folder = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../temp"))
+
+        if not os.path.exists(temp_folder):
+            os.makedirs(temp_folder)
+
+        # Compute a unique hash for the file (MD5 is fast for most files)
+        file_hash = self.compute_file_hash(file_path)
+
+        # Get the base name and extension of the file
+        base_name = os.path.basename(file_path)
+        base, ext = os.path.splitext(base_name)
+
+        # Define suffix mappings (inspired by generateJson.py)
+        projection_suffix_mapping = {
+            "Flat 2D plane": "_screen",
+            "Equirectangular - 180° FOV": "_180",
+            "Equirectangular - 360° FOV": "_360",
+            "Fisheye projection - 180° FOV": "_fisheye",
+            "Fisheye projection - 190° FOV": "_fisheye190",
+            "Fisheye projection - 200° FOV with MKX lens correction": "_mkx200",
+            "Fisheye projection - 220° FOV with VRCA lens correction": "_vrca220"
+        }
+        stereo_suffix_mapping = {
+            "Side-by-Side": "_SBS",
+            "Top-Bottom": "_TB"
+        }
+
+        proj_suffix = projection_suffix_mapping.get(projection_type, "")
+        stereo_suffix = stereo_suffix_mapping.get(eye_location, "")
+
+        # Create the new file name: [hash]_[base][proj_suffix][stereo_suffix][ext]
+        new_file_name = f"{file_hash}_{base}{proj_suffix}{stereo_suffix}{ext}"
+        new_file_path = os.path.join(temp_folder, new_file_name)
+
+        # If the file doesn't already exist in the temp folder, copy it.
+        if not os.path.exists(new_file_path):
+            try:
+                shutil.copy2(file_path, new_file_path)
+                print(f"Copied file to: {new_file_path}")
+            except Exception as e:
+                print(f"Error copying file: {e}")
+                return ()
+
+        # Create the JSON command to send to DeoVR.
+        command = {
+            "path": new_file_path,
+            "screenType": proj_suffix[1:] if proj_suffix.startswith("_") else "flat",
+            "stereoMode": stereo_suffix[1:].lower() if stereo_suffix.startswith("_") else "sbs",
+            "is3d": True
+        }
+
+        # Send the command.
+        self.send_command_to_deovr(command)
+        return ()
+
+    def send_command_to_deovr(self, command):
+        """Handles sending the command to the DeoVR remote control API."""
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.connect(("127.0.0.1", 23554))  # DeoVR's remote control port
+                command_json = json.dumps(command)
+                length_prefix = len(command_json).to_bytes(4, byteorder='little')
+                packet = length_prefix + command_json.encode('utf-8')
+                s.sendall(packet)
+                print(f"✅ Sent command to DeoVR: {command}")
+        except Exception as e:
+            print(f"❌ Error sending command to DeoVR: {e}")
+
+    def compute_file_hash(self, file_path):
+        """Computes an MD5 hash of the file for a unique identifier."""
+        hash_md5 = hashlib.md5()
+        try:
+            with open(file_path, "rb") as f:
+                for chunk in iter(lambda: f.read(4096), b""):
+                    hash_md5.update(chunk)
+            return hash_md5.hexdigest()
+        except Exception as e:
+            print(f"Error computing file hash: {e}")
+            return "errorhash"
+
+
+
 def tensor2np(tensor: torch.Tensor) -> np.ndarray:
     if tensor.dim() == 4:  # Batch of images
         tensor = tensor[0]  # Assuming we take the first image in the batch
@@ -339,10 +546,12 @@ def tensor2pil(image):
 
 NODE_CLASS_MAPPINGS = {
 #    "LazyStereo": LazyStereo,
-    "StereoImageNode": StereoImageNode
+    "StereoImageNode": StereoImageNode,
+    "DeoVRViewNode": DeoVRViewNode
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
 #    "LazyStereo": "LazyStereo",
-    "StereoImageNode": "Stereo Image Node"
+    "StereoImageNode": "Stereo Image Node",
+    "DeoVRViewNode": "DeoVR View"
 }
