@@ -1,18 +1,25 @@
+
 # ComfyStereo
 # Introduction
-A  port of the stereoscopic script used in thygate/stable-diffusion-webui-depthmap-script
-Most of the credit goes to them, and most of the rest to some LLMs.
 
-Included is also a node for launching and viewing images and videos in DeoVR
-For this node to be able to launch DeoVR you must configure tha DeoVR.exe path in the config file:
+* **Stereo Image Node** - a basic port from the Automatic1111 stereo script with some extra features added, such as edge and direction aware blurring of the depth map. 
+* **DeoVR View** - A node for launching and viewing images and videos in DeoVR
+
+-----------
+
+For the DeoVR View node to be able to launch DeoVR you must configure tha DeoVR.exe path in the config file:
+
 *ComfyUI\custom_nodes\comfystereo\config.json*
 
-This by default is set to
+---
+This by default is set to:
+
 "C:\\Program Files (x86)\\Steam\\steamapps\\common\\DeoVR Video Player\\DeoVR.exe"
 
-You MUST already be viewing an image/video before this node can change what is being viewed in the headset. If you are at the main menu screen of DeoVR it will not work.
+You **MUST** already be viewing an image/video before this node can change what is being viewed in the headset. If you are at the main menu screen of DeoVR it will not work.
 The launcher does this by default, but if you have already started DeoVR you have to open up an image before this works.
 
+------
 https://github.com/user-attachments/assets/b76e6243-557b-454b-9baa-1aac2a7eb22a
 
 
