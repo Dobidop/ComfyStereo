@@ -26,9 +26,11 @@ https://github.com/user-attachments/assets/b76e6243-557b-454b-9baa-1aac2a7eb22a
 Added some new functionality such as edge and direction aware blur of the depth map. I've also managed to add some additional interpolation and stereo distortion methods. By 'I', I mean I tortured ChatGPT for hours.
 
 #### Things to note
-To activate the adaptive blurring, set 'depth_blur_sigma' (the amount of blur applied) to a value greater than 0.
+To activate the **adaptive blurring***, set 'depth_blur_sigma' (the amount of blur applied) to a **value greater than 0**.
 
 The mask output is imperfect and only provides useful output for the 'No fill' options.
+
+If you see **low CPU utilization** when running the node without depth map blurring you might want to **update python and/or ComfyUI-Manager** as that seemed to have solved the issue for one user who had this issue.
 
 ### Stereo Image Generation Methods
 
