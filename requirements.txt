@@ -2,4 +2,6 @@ torch
 numpy
 Pillow
 opencv-python
+numba
+scipy
 psutil

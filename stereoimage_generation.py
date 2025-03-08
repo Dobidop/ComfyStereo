@@ -9,6 +9,8 @@ except Exception as e:
 import numpy as np
 from PIL import Image
 import math
+from scipy.ndimage import convolve1d, binary_dilation, sobel
+#import matplotlib.pyplot as plt
 
 def blur_depth_map(depth, sigma):
     """
@@ -103,9 +105,78 @@ def right_direction_aware_blur_depth_map(depth, sigma, edge_threshold):
     blurred = blur_depth_map(depth, sigma)
     return (1.0 - weight) * depth + weight * blurred
 
+def directional_motion_blur(depth, blur_strength, edge_threshold, blur_mask_width=5):
+    """
+    Applies directional motion blur to depth map edges instead of Gaussian blur.
+    
+    - Generates separate masks for left and right eye depth adjustments.
+    - Applies **horizontal motion blur** only within the masked regions.
+    - Ensures blur extends in the correct direction for better stereo depth.
+    - Uses **Sobel filtering** for better edge detection.
+    
+    Parameters:
+        depth (ndarray): Input depth map
+        blur_strength (float): Generally, the width of the blur
+        edge_threshold (float): Edge detection threshold (used adaptively)
+        blur_mask_width (float): How wide the mask should be
+    
+    Returns:
+        left_blurred (ndarray): Depth map modified for the left eye
+        right_blurred (ndarray): Depth map modified for the right eye
+    """
+    if blur_strength <= 0:
+        return depth, depth  # No modification needed
+    
+    blur_strength = int(round(blur_strength))  # Ensure blur length is an integer
+    
+    h, w = depth.shape
+    
+    # Compute horizontal gradient using Sobel filtering for better edge detection
+    grad_x = sobel(depth, axis=1)
+    
+    # Compute edge strength using fixed threshold
+    edge_strength = np.abs(grad_x) / (10*edge_threshold)
+    edge_strength = np.clip(edge_strength, 0, 1)
+    
+    # Create separate edge masks
+    left_edge_mask = (grad_x > 0) & (edge_strength > 0.5)  # Left eye: Positive gradients
+    right_edge_mask = (grad_x < 0) & (edge_strength > 0.5)  # Right eye: Negative gradients
+    
+    # Define mask expansion width separately from blur strength
+    mask_radius = int(blur_mask_width)
+    
+    # Create directional dilation structures for better blending
+    struct_right = np.ones((1, mask_radius), dtype=bool)  # Dilation extends rightward
+    struct_left = np.ones((1, mask_radius), dtype=bool)   # Dilation extends leftward
+    
+    # Apply directional dilation
+    left_dilated_mask = binary_dilation(left_edge_mask, struct_right)
+    right_dilated_mask = binary_dilation(right_edge_mask, struct_left)
+    
+    # Save masks for debugging
+    #plt.imsave("left_mask.png", left_dilated_mask.astype(np.uint8) * 255, cmap='gray')
+    #plt.imsave("right_mask.png", right_dilated_mask.astype(np.uint8) * 255, cmap='gray')
+    
+    # Create a horizontal motion blur kernel
+    blur_kernel = np.ones(blur_strength) / (blur_strength)
+    
+    # Initialize output depth maps
+    left_blurred = depth.copy()
+    right_blurred = depth.copy()
+    
+    # Apply **motion blur only within the masked region**
+    blurred_depth_left = convolve1d(depth, blur_kernel, axis=1, mode='nearest')
+    blurred_depth_right = convolve1d(depth, blur_kernel[::-1], axis=1, mode='nearest')
+    
+    left_blurred[left_dilated_mask] = blurred_depth_left[left_dilated_mask]
+    right_blurred[right_dilated_mask] = blurred_depth_right[right_dilated_mask]
+    
+    return left_blurred, right_blurred
+
+
 def create_stereoimages(original_image, depthmap, divergence, separation=0.0, modes=None,
                         stereo_balance=0.0, stereo_offset_exponent=1.0, fill_technique='polylines_sharp',
-                        depth_blur_sigma=0.0, depth_blur_edge_threshold=10.0,
+                        depth_blur_strength=0.0, depth_blur_edge_threshold=6.0,
                         direction_aware_depth_blur=False, return_modified_depth=True):
                             
     """
@@ -134,8 +205,8 @@ def create_stereoimages(original_image, depthmap, divergence, separation=0.0, mo
       (stereo_images, modified_depth) is returned, where modified_depth is produced by the
       global edge-selective blur. If return_modified_depth is False, only stereo_images is returned.
     """
-    if depth_blur_sigma > 0:
-        direction_aware_depth_blur = True
+    #if depth_blur_strength > 0:
+    #    direction_aware_depth_blur = True
     
     if modes is None:
         modes = ['left-right']
@@ -148,12 +219,12 @@ def create_stereoimages(original_image, depthmap, divergence, separation=0.0, mo
     depthmap = np.asarray(depthmap).astype(np.float64)
     
     if direction_aware_depth_blur:
-        left_depthmap = left_direction_aware_blur_depth_map(depthmap, depth_blur_sigma, depth_blur_edge_threshold)
-        right_depthmap = right_direction_aware_blur_depth_map(depthmap, depth_blur_sigma, depth_blur_edge_threshold)
+        left_depthmap, right_depthmap = directional_motion_blur(depthmap, divergence, depth_blur_edge_threshold, divergence)
+
     else:
         # Global edge-selective blur (as before)
-        if depth_blur_sigma > 0:
-            depthmap = edge_selective_blur_depth_map(depthmap, depth_blur_sigma, depth_blur_edge_threshold)
+#        if depth_blur_strength > 0:
+#            depthmap = edge_selective_blur_depth_map(depthmap, depth_blur_strength, depth_blur_edge_threshold)
         left_depthmap = right_depthmap = depthmap
 
     # Save modified depth maps for output.

@@ -5,10 +5,6 @@ import sys
 from typing import Union, List
 from PIL import Image
 import cv2
-import numpy as np
-import torch
-from typing import Union, List
-from PIL import Image, ImageFilter, ImageEnhance, ImageOps, ImageDraw, ImageChops, ImageFont
 
 file_dir = os.path.dirname(__file__)
 sys.path.append(file_dir)
@@ -18,19 +14,15 @@ import stereoimage_generation as sig
 from comfy.utils import ProgressBar
 
 import socket
-import json
-import io
-import base64
-
-import os
-import socket
-import json
 import hashlib
 import shutil
-
-import subprocess
-import psutil
 import time
+import json
+import psutil
+import subprocess
+
+
+
 
 class DeoVRLauncher:
     def __init__(self, config_path):
@@ -51,14 +43,16 @@ class DeoVRLauncher:
             print(f"X  Error reading config file: {e}")
             return None
 
+    def is_process_running(self, process_name):
+        """Checks if a process with the given name is running."""
+        for process in psutil.process_iter(attrs=['name']):
+            if process.info['name'].lower() == process_name.lower():
+                return True
+        return False
+
     def is_deovr_running(self):
         """Checks if DeoVR.exe is currently running."""
-        for process in psutil.process_iter(attrs=['name']):
-            if process.info['name'].lower() == "deovr.exe":
-                #print("OK!  DeoVR is already running.")
-                return True
-        print("!  DeoVR is not running.")
-        return False
+        return self.is_process_running("deovr.exe")
 
     def create_dummy_image(self, temp_folder):
         """Creates a black dummy image in the temp folder."""
@@ -77,9 +71,10 @@ class DeoVRLauncher:
             return None
 
     def launch_deovr(self):
-        """Launches DeoVR with the dummy image if it's not already running."""
+        """Launches DeoVR and waits for it to start, checking every 2 seconds for up to 30 seconds."""
+
         if self.is_deovr_running():
-            print("OK!  DeoVR is already running. No need to launch.")
+            print("OK! DeoVR is already running. No need to launch.")
             return
 
         if not self.deovr_path:
@@ -87,29 +82,53 @@ class DeoVRLauncher:
             return
             
         if not os.path.exists(self.deovr_path):
-            print(" ")
-            print(" ")
-            print(f"XXX  DeoVR path seems to be incorrect, file not found: {self.deovr_path}")
-            print(f"XXX  Update the config file in ComfyUI\custom_nodes\comfystereo\config.json to point to your DeoVR.exe file to autostart it when triggering this node.")
-            print(f"!!!  You can still use this node though. Start DeoVR manually, then open any image, then this node can pass an image/video to it.")
-            print(" ")
-            print(" ")
-            return None
+            print("\nXXX  DeoVR path seems to be incorrect, file not found:")
+            print(f"XXX  {self.deovr_path}")
+            print("XXX  Update the config file to point to your DeoVR.exe file to autostart it.")
+            print("!!!  You can still use this manually by launching DeoVR and opening an image/video.")
+            return
 
+        # Check if VR-related processes are running
+        vr_processes = ["vrmonitor.exe", "vrwebhelper.exe"]
+        initial_wait_time = 0
+
+        for proc in vr_processes:
+            if not self.is_process_running(proc):
+                print(f"! {proc} is not running. Waiting an extra 3 seconds.")
+                initial_wait_time += 3
+
+        # Try launching DeoVR
         script_directory = os.path.dirname(os.path.abspath(__file__))
         loading_image_path = os.path.join(script_directory, 'loading_sbs_flat.png')
 
         try:
             subprocess.Popen([self.deovr_path, loading_image_path], shell=True)
-            print(f"! Launched DeoVR...")
-            print(f" Waiting for DeoVR to start...")
-            time.sleep(5)
-            print(f" Still waiting for DeoVR to start... heat death of the universe approaching...")
-            time.sleep(5)
-            print(f" DeoVR... Any moment now... Soon™")
-            time.sleep(5)
+            print(">> Launched DeoVR...")
         except Exception as e:
             print(f"XXX  Error launching DeoVR: {e}")
+            return
+
+        # Wait for DeoVR to start (polling every 2 seconds, max 30 seconds + extra time)
+        max_wait_time = 30 + initial_wait_time
+        elapsed_time = 1
+
+        print(" Waiting for DeoVR to start...")
+
+        time.sleep(initial_wait_time)
+
+        while elapsed_time < max_wait_time:
+            if self.is_deovr_running():
+                print("OK! DeoVR has successfully launched.")
+                #time.sleep(10)  # Final wait before proceeding
+                return
+
+            if elapsed_time % 6 == 0:  # Print status every 6 seconds
+                print(f" Still waiting... ({elapsed_time}/{max_wait_time} seconds)")
+            time.sleep(2)
+            elapsed_time += 2
+
+        print("XXX  ERROR: DeoVR did not start within the expected time.")
+
 
 
 class DeoVRViewNode:
@@ -117,7 +136,7 @@ class DeoVRViewNode:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "file_path": ("STRING", {"forceInput": True}),  # User-provided file or video path
+                "file_name": ("STRING", {"forceInput": True}),  # User-provided file or video path
                 "projection_type": ([
                     "Flat 2D plane",
                     "Equirectangular - 180° FOV",
@@ -128,6 +147,7 @@ class DeoVRViewNode:
                     "Fisheye projection - 220° FOV with VRCA lens correction"
                 ],),
                 "eye_location": (["Side-by-Side", "Top-Bottom"],),
+                "file_location": (["Output folder", "Input folder", "Other (provide full path)"],),
             }
         }
 
@@ -136,7 +156,7 @@ class DeoVRViewNode:
     CATEGORY = "Output"
     OUTPUT_NODE = True
 
-    def send_path_to_deovr(self, file_path, projection_type, eye_location):
+    def send_path_to_deovr(self, file_name, projection_type, eye_location, file_location):
         """
         Copies the file to ComfyUI's temp folder with a modified name based on the projection type and eye location.
         A unique MD5 hash is computed for the file to ensure uniqueness. If the file has been copied before,
@@ -146,9 +166,15 @@ class DeoVRViewNode:
         launcher = DeoVRLauncher(config_path)
         launcher.launch_deovr()
         
-        
-        if not os.path.exists(file_path):
-            print(f"Error: The specified file does not exist: {file_path}")
+        if file_location == "Output folder":
+            file_name = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../output/", file_name))
+
+        if file_location == "Input folder":
+            file_name = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../input/", file_name))
+
+
+        if not os.path.exists(file_name):
+            print(f"Error: The specified file does not exist: {file_name}")
             return ()
 
         # Define the temp folder relative to ComfyUI (two levels up)
@@ -158,10 +184,10 @@ class DeoVRViewNode:
             os.makedirs(temp_folder)
 
         # Compute a unique hash for the file (MD5 is fast for most files)
-        file_hash = self.compute_file_hash(file_path)
+        file_hash = self.compute_file_hash(file_name)
 
         # Get the base name and extension of the file
-        base_name = os.path.basename(file_path)
+        base_name = os.path.basename(file_name)
         base, ext = os.path.splitext(base_name)
 
         # Define suffix mappings (inspired by generateJson.py)
@@ -189,7 +215,7 @@ class DeoVRViewNode:
         # If the file doesn't already exist in the temp folder, copy it.
         if not os.path.exists(new_file_path):
             try:
-                shutil.copy2(file_path, new_file_path)
+                shutil.copy2(file_name, new_file_path)
                 print(f"Copied file to: {new_file_path}")
             except Exception as e:
                 print(f"Error copying file: {e}")
@@ -203,22 +229,53 @@ class DeoVRViewNode:
             "is3d": True
         }
 
-        # Send the command.
-        self.send_command_to_deovr(command)
+
+        max_retries = 10
+        tries = 0
+        # Send the command
+        while tries <= max_retries:
+            message, errormessage = self.send_command_to_deovr(command)
+
+            if message == 'error':
+                #print(f"Retrying to send command to DeoVR")
+                time.sleep(2)
+                tries = tries + 1
+            else:
+                return ()
+            
+        print(f"Failed to send command to DeoVR")
+        print(f"Error message: {errormessage}")
         return ()
 
     def send_command_to_deovr(self, command):
-        """Handles sending the command to the DeoVR remote control API."""
+        """Handles sending a command to the DeoVR remote control API and returns the response."""
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.connect(("127.0.0.1", 23554))  # DeoVR's remote control port
                 command_json = json.dumps(command)
                 length_prefix = len(command_json).to_bytes(4, byteorder='little')
                 packet = length_prefix + command_json.encode('utf-8')
+                
+                # Send command
                 s.sendall(packet)
-                print(f"✅ Sent command to DeoVR: {command}")
+                #print(f"✅ Sent command to DeoVR: {command}")
+
+                # Read response from server
+                response_length_bytes = s.recv(4)  # First 4 bytes indicate message length
+                if not response_length_bytes:
+                    #print("❌ No response received from DeoVR.")
+                    return None
+                
+                response_length = int.from_bytes(response_length_bytes, byteorder='little')
+                response_data = s.recv(response_length).decode('utf-8')
+                response_json = json.loads(response_data)
+
+                #print(f"📩 Received response from DeoVR: {response_json}")
+                return response_json, ''  # Return the parsed response
+
         except Exception as e:
-            print(f"❌ Error sending command to DeoVR: {e}")
+            #print(f"❌ Error sending command to DeoVR: {e}")
+            return 'error', e
 
     def compute_file_hash(self, file_path):
         """Computes an MD5 hash of the file for a unique identifier."""
@@ -261,24 +318,23 @@ class StereoImageNode:
                     'Fill - Naive interpolating', 'Fill - Polylines Soft', 'Fill - Polylines Sharp',
                     'Fill - Post-fill', 'Fill - Reverse projection with Post-fill', 'Fill - Hybrid Edge with fill'
                 ], {"default": "Fill - Polylines Soft"}),
-                #"return_basic_mask": ("BOOLEAN", {"default": False}),
             },
             "optional": {
                 "divergence": ("FLOAT", {"default": 3.5, "min": 0.05, "max": 15, "step": 0.01}), 
                 "separation": ("FLOAT", {"default": 0, "min": -5, "max": 5, "step": 0.01}),
                 "stereo_balance": ("FLOAT", {"default": 0, "min": -0.95, "max": 0.95, "step": 0.05}),
                 "stereo_offset_exponent": ("FLOAT", {"default": 2, "min": 1, "max": 2, "step": 1}),
-                "depth_blur_sigma": ("FLOAT", {"default": 0, "min": 0, "max": 10, "step": 0.1}),
-                "depth_blur_edge_threshold": ("FLOAT", {"default": 40, "min": 0.1, "max": 100, "step": 0.1})
+                "depth_map_blur": ("BOOLEAN", {"default": True}),
+                "depth_blur_edge_threshold": ("FLOAT", {"default": 6, "min": 0.1, "max": 15, "step": 0.1}),
             }
         }
     
     RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", "MASK")
-    RETURN_NAMES = ("stereoscope", "modified_depthmap_left", "modified_depthmap_right", "no_fill_imperfect_mask")
+    RETURN_NAMES = ("stereoscope", "blurred_depthmap_left", "blurred_depthmap_right", "no_fill_imperfect_mask")
     FUNCTION = "generate"
 
     def generate(self, image, depth_map, divergence, separation, modes, 
-                 stereo_balance, stereo_offset_exponent, fill_technique, depth_blur_sigma, depth_blur_edge_threshold):# return_basic_mask):
+                 stereo_balance, stereo_offset_exponent, fill_technique, depth_blur_edge_threshold, depth_map_blur):
         
         fill_technique_mapping = {
             'No fill': 'none',
@@ -314,7 +370,8 @@ class StereoImageNode:
             
             output = sig.create_stereoimages(img, dm, divergence, separation,  
                                              [modes], stereo_balance, stereo_offset_exponent, 
-                                             fill_technique, depth_blur_sigma, depth_blur_edge_threshold)
+                                             fill_technique, 5, depth_blur_edge_threshold, depth_map_blur)
+
             
             if len(output) == 3:
                 results, left_modified_depthmap, right_modified_depthmap = output
