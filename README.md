@@ -1,126 +1,121 @@
-
 # ComfyStereo
-# Introduction
 
-* **Stereo Image Node** - a basic port from the Automatic1111 stereo script with some extra features added, such as edge and direction aware blurring of the depth map. 
-* **DeoVR View** - A node for launching and viewing images and videos in DeoVR
+## Introduction
 
------------
-
-For the DeoVR View node to be able to launch DeoVR you must configure tha DeoVR.exe path in the config file:
-
-*ComfyUI\custom_nodes\comfystereo\config.json*
-
----
-This by default is set to:
-
-"C:\\Program Files (x86)\\Steam\\steamapps\\common\\DeoVR Video Player\\DeoVR.exe"
-
-You **MUST** already be viewing an image/video before this node can change what is being viewed in the headset. If you are at the main menu screen of DeoVR it will not work.
-The launcher does this by default, but if you have already started DeoVR you have to open up an image before this works.
-
-------
-https://github.com/user-attachments/assets/b76e6243-557b-454b-9baa-1aac2a7eb22a
-
-
-Added some new functionality such as edge and direction aware blur of the depth map. I've also managed to add some additional interpolation and stereo distortion methods. By 'I', I mean I tortured ChatGPT for hours.
-
-#### Things to note
-To activate the **adaptive blurring**, set 'depth_blur_sigma' (the amount of blur applied) to a **value greater than 0**.
-
-The mask output is imperfect and only provides useful output for the 'No fill' options.
-
-If you see **low CPU utilization** when running the node without depth map blurring you might want to **update python and/or ComfyUI-Manager** as that seemed to have solved the issue for one user who had this issue.
-
-### Stereo Image Generation Methods
-
-### Summary Table
-
-| Method                 | Description |
-|------------------------|-------------|
-| **'No fill'**            | Simple depth shift with no gap filling. |
-| **'No fill - Reverse projection'**         | Works backward to assign pixel values but leaves gaps. |
-| **'Imperfect fill - Hybrid Edge'**     | Mixes 'Polylines' and 'Reverse projection' for better results. |
-| **'Fill - Naive'**           | Fills gaps with nearest pixel, causing stretching. |
-| **'Fill - Naive interpolating'** | Uses interpolation to smooth out gaps. |
-| **'Fill - Polylines Soft'**  | Uses polylines with soft edges to maintain structure. |
-| **'Fill - Polylines Sharp'** | Like 'soft' but with sharper transitions. |
-| **'Fill - Post-fill'**       | 'No fill' with edge-aware interpolation and blending. |
-| **'Fill - Reverse projection with Post-fill'**    | 'Reverse projection' with directional interpolation and blurring. |
-| **'Fill - Hybrid Edge with fill'** | Enhanced version of 'Hybrid Edge' with adaptive smoothing. |
-
-1. **'No fill'**  
-   - Basic method that applies the depth-based shift but does **not** fill in gaps left by the transformation.  
-   - Results in visible holes where pixels are moved but no data is available to replace them.
-
-2. **'No fill - Reverse projection'**  
-   - Instead of shifting pixels **away from their original positions**, it works **backward**:  
-     - For each output pixel, it looks at where it would have originated and assigns a value accordingly.  
-   - More accurate in some cases but tends to leave gaps.
-
-3. **'Imperfect fill - Hybrid Edge'**  
-   - Combines **'Polylines'** and **'Reverse projection'** techniques:  
-     - Uses 'Polylines' for **continuous** regions to preserve structure.  
-     - Uses 'Reverse projection' for **discontinuous** areas to avoid stretching.  
-   - Works well in most cases but may still struggle with extreme depth changes.
-
-4. **'Fill - Naive'**  
-   - Moves pixels according to depth but **fills in gaps** using the nearest available pixel.  
-   - This leads to **stretched artifacts** but removes the most obvious missing data.
-
-5. **'Fill - Naive interpolating'**  
-   - Like 'naive' but **interpolates between neighboring pixels** to fill gaps smoothly.  
-   - Reduces stretching artifacts but still relies on simple heuristics.
-
-6. **'Fill - Polylines Soft'**  
-   - Treats each row of pixels as a **polyline** and shifts it while attempting to maintain structure.  
-   - Uses **soft edges**, meaning transition areas are blended more smoothly.  
-   - Better at preserving fine details and gradients.
-
-7. **'Fill - Polylines Sharp'**  
-   - Similar to 'Polylines Soft' but with **sharper transitions** at edges.  
-   - Avoids excessive blending but may introduce jagged artifacts in areas with sharp depth changes.
-
-8. **'Fill - Post-fill'**  
-   - Applies the **'No fill'** method first, then post-processes using:  
-     - **Edge-aware interpolation**, attempting to fill gaps based on nearby structures.  
-     - **Blending techniques** to smooth out harsh transitions.  
-   - Improves upon 'No fill' but still has artifacts in extreme cases.
-
-9. **'Fill - Reverse projection with Post-fill'**  
-   - Applies the **'inverse'** method first, then post-processes using:  
-     - **Directional interpolation** to fill missing areas more intelligently.  
-     - **Blurring corrections** to reduce sharp edge artifacts.  
-   - A more refined version of 'Reverse projection' that significantly improves final image quality.
-
-10. **'Fill - Hybrid Edge with fill'**  
-   - An advanced version of 'hybrid_edge' with:  
-     - **Stronger edge-aware processing** to ensure smooth depth transitions.  
-     - **Adaptive interpolation** based on local depth complexity.  
-     - **Directional-aware smoothing** to further refine edges.  
-   - Better in some cases.
+- **Stereo Image Node** – A port of the **Automatic1111 stereo script** with added features like **edge-aware and direction-aware blurring of the depth map**.
+- **DeoVR View Node** – A node for launching and viewing images and videos in **DeoVR**.
 
 ---
 
+## DeoVR View Node Setup
 
-# Installation
+To launch DeoVR from this node, you must configure the path to **DeoVR.exe** in the configuration file:
 
-## Easy method
-
-Use ComfyUI-Manager
-
-## Manual install
-
-To install the these nodes, clone this repository and add it to custom_nodes folder in your ComfyUI nodes directory:
 ```
+ComfyUI\custom_nodes\comfystereo\config.json
+```
+
+### Default Path:
+```
+"C:\\Program Files (x86)\\Steam\\steamapps\\common\\DeoVR Video Player\\DeoVR.exe"
+```
+
+### Important Notes:
+- You **must** already have an image or video open in DeoVR before this node can change what is displayed in the headset.
+- If DeoVR is on its **main menu screen**, this will not work.
+- The launcher skips the main menu screen automatically, but if you manually start DeoVR, you need to open an image/video before using this node.
+
+---
+
+## New Features & Depth Map Blurring
+
+New functionality includes **edge-aware and direction-aware blurring** of the depth map, additional interpolation methods, and **stereo distortion improvements**.  
+
+### **Depth map blurring:**
+- **Reduces artifacts and harsh transitions** in the final stereo image, especially at **higher divergence settings**.
+- **Trade-off**: It **increases computation time** (5-25%). If speed is a concern, you may want to disable it.
+- `depth_map_threshhold` sets the depth map gradient sharpness application cutoff. Low values will apply the blur to more shallow gradients, blurring the depth map more broadly (which can negativbely affect the end result). Higher values isolates the steeper gradients.
+
+### **How to Enable Adaptive Blurring**
+- Set `'depth_map_blur' = True`.
+
+### **Mask Output Considerations**
+- The mask output is **imperfect** and is mainly useful for the **"No Fill"** and **"Imperfect Fill"** options. This outputs a black and white image of the areas which were not filled in.
+
+---
+
+## Stereo Image Generation Methods
+
+### **Key Parameters**
+#### **Separation (`separation`)**
+- Defines an additional **horizontal shift percentage** applied to the left and right images.
+- Modifies the distance between the stereo pair, affecting alignment.
+
+#### **Divergence (`divergence`)**
+- Controls the **strength of the 3D effect** (in percentage terms).
+- A higher divergence increases depth perception, while a lower value creates a flatter effect.
+
+#### **Stereo Balance (`stereo_balance`)**
+- Determines how **divergence is distributed** between the two eyes.
+- `0.0` = Even distribution  
+- Positive/negative values shift the effect toward one eye.
+
+#### **Stereo Offset Exponent (`stereo_offset_exponent`)**
+- Adjusts **depth-to-offset mapping**, influencing how depth values are converted into horizontal shifts.
+
+---
+
+## Infill Methods
+
+Some fill methods are **faster**, while others **preserve structure better**.  
+- **Naive methods** are slightly quicker.  
+- **Polylines Soft** is often the best general filler.
+
+### **Comparison of Infill Techniques**
+
+| Method                                      | Description |
+|---------------------------------------------|-------------|
+| **No Fill**                                  | Shifts pixels based on depth without filling gaps. |
+| **No Fill - Reverse Projection**            | Works backward to assign pixel values but leaves gaps. |
+| **Imperfect Fill - Hybrid Edge**            | Mixes "Polylines" and "Reverse Projection" for better structure. |
+| **Fill - Naive**                             | Fills gaps using nearest pixels (causes stretching). |
+| **Fill - Naive Interpolating**               | Uses interpolation to smooth gaps. |
+| **Fill - Polylines Soft**                    | Uses polylines with **soft edges** to maintain structure. |
+| **Fill - Polylines Sharp**                   | Similar to "Soft" but with **sharper transitions**. |
+| **Fill - Post-Fill**                         | "No fill" + **edge-aware interpolation**. |
+| **Fill - Reverse Projection + Post-Fill**    | "Reverse Projection" + **directional interpolation**. |
+| **Fill - Hybrid Edge with Fill**             | Enhanced "Hybrid Edge" with adaptive smoothing. |
+
+---
+
+## Installation
+
+### **Easy Method (Recommended)**
+Use **ComfyUI-Manager** for quick installation.
+
+### **Manual Installation**
+Clone the repository and place it in ComfyUI's `custom_nodes` directory:
+```sh
 git clone https://github.com/Dobidop/ComfyStereo.git
 pip install -r requirements.txt
 ```
 
-# Example workflow
+---
 
-Image
-![workflow(5)](https://github.com/user-attachments/assets/22c56260-3029-4a61-ae90-d925924e8fcf)
+## Example Workflow
 
-Video
-![workflow(6)](https://github.com/user-attachments/assets/a13d37da-a62f-43b6-9e92-0c0c5e8592fc)
+### **Image Output**
+![workflow(7)](https://github.com/user-attachments/assets/4fb1ff7d-7d3e-4c9f-b389-ec134d624f4e)
+
+
+### **Video Output**
+![workflow(8)](https://github.com/user-attachments/assets/0a61bc30-1821-40b8-b90d-12733f85bdea)
+
+
+---
+
+## Troubleshooting
+
+- **Low CPU utilization?**  
+  - Try **updating Python and ComfyUI-Manager**—this fixed the issue for one user.  
+
