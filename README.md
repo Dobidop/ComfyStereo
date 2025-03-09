@@ -9,6 +9,8 @@
 
 ## DeoVR View Node Setup
 
+In DeoVR, set "Enable remote control" to true in the developer settings.
+
 To launch DeoVR from this node, you must configure the path to **DeoVR.exe** in the configuration file:
 
 ```
