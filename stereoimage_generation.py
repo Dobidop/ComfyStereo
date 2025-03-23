@@ -560,7 +560,7 @@ def apply_stereo_divergence_naive(
                 elif sum(r_border) == 0:
                     r_border = l_border
                 total_steps = 1 + r_pointer - l_pointer
-                step = (r_border.astype(np.float_) - l_border) / total_steps
+                step = (r_border.astype(np.float64) - l_border) / total_steps
                 for col in range(l_pointer, r_pointer):
                     derived_image[row][col] = l_border + (step * (col - l_pointer + 1)).astype(np.uint8)
         return derived_image
@@ -590,7 +590,7 @@ def apply_stereo_divergence_polylines(original_image, normalized_depth, divergen
     h, w, c = original_image.shape
     derived_image = np.zeros_like(original_image)
     for row in prange(h):
-        pt = np.zeros((5 + 2 * w, 3), dtype=np.float_)
+        pt = np.zeros((5 + 2 * w, 3), dtype=np.float64)
         pt_end: int = 0
         pt[pt_end] = [-1.0 * w, 0.0, 0.0]
         pt_end += 1
@@ -607,7 +607,7 @@ def apply_stereo_divergence_polylines(original_image, normalized_depth, divergen
         pt[pt_end] = [2.0 * w, 0.0, w - 1]
         pt_end += 1
         sg_end: int = pt_end - 1
-        sg = np.zeros((sg_end, 6), dtype=np.float_)
+        sg = np.zeros((sg_end, 6), dtype=np.float64)
         for i in range(sg_end):
             sg[i] += np.concatenate((pt[i], pt[i + 1]))
         for i in range(1, sg_end):
@@ -616,12 +616,12 @@ def apply_stereo_divergence_polylines(original_image, normalized_depth, divergen
                 pt[u], pt[u + 1] = np.copy(pt[u + 1]), np.copy(pt[u])
                 sg[u], sg[u + 1] = np.copy(sg[u + 1]), np.copy(sg[u])
                 u -= 1
-        csg = np.zeros((5 * int(abs(divergence_px)) + 25, 6), dtype=np.float_)
+        csg = np.zeros((5 * int(abs(divergence_px)) + 25, 6), dtype=np.float64)
         csg_end: int = 0
         sg_pointer: int = 0
         pt_i: int = 0
         for col in range(w):
-            color = np.full(c, 0.5, dtype=np.float_)
+            color = np.full(c, 0.5, dtype=np.float64)
             while pt[pt_i][0] < col:
                 pt_i += 1
             pt_i -= 1
