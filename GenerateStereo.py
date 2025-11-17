@@ -320,9 +320,10 @@ class StereoImageNode:
                 ], {"default": "Fill - Polylines Soft"}),
             },
             "optional": {
-                "divergence": ("FLOAT", {"default": 3.5, "min": 0.05, "max": 15, "step": 0.01}), 
+                "divergence": ("FLOAT", {"default": 3.5, "min": 0.05, "max": 15, "step": 0.01}),
                 "separation": ("FLOAT", {"default": 0, "min": -5, "max": 5, "step": 0.01}),
                 "stereo_balance": ("FLOAT", {"default": 0, "min": -0.95, "max": 0.95, "step": 0.05}),
+                "convergence_point": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "stereo_offset_exponent": ("FLOAT", {"default": 2, "min": 1, "max": 2, "step": 1}),
                 "depth_map_blur": ("BOOLEAN", {"default": True}),
                 "depth_blur_edge_threshold": ("FLOAT", {"default": 6, "min": 0.1, "max": 15, "step": 0.1}),
@@ -333,8 +334,8 @@ class StereoImageNode:
     RETURN_NAMES = ("stereoscope", "blurred_depthmap_left", "blurred_depthmap_right", "no_fill_imperfect_mask")
     FUNCTION = "generate"
 
-    def generate(self, image, depth_map, divergence, separation, modes, 
-                 stereo_balance, stereo_offset_exponent, fill_technique, depth_blur_edge_threshold, depth_map_blur):
+    def generate(self, image, depth_map, divergence, separation, modes,
+                 stereo_balance, convergence_point, stereo_offset_exponent, fill_technique, depth_blur_edge_threshold, depth_map_blur):
         
         fill_technique_mapping = {
             'No fill': 'none',
@@ -389,7 +390,8 @@ class StereoImageNode:
 
             output = sig.create_stereoimages(img_tensor, dm_tensor, divergence, separation,
                                              [modes], stereo_balance, stereo_offset_exponent,
-                                             fill_technique, depth_blur_strength, depth_blur_edge_threshold, depth_map_blur)
+                                             fill_technique, depth_blur_strength, depth_blur_edge_threshold,
+                                             depth_map_blur, convergence_point=convergence_point)
 
             
             if len(output) == 3:

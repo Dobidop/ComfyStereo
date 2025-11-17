@@ -65,8 +65,20 @@ New functionality includes **edge-aware and direction-aware blurring** of the de
 
 #### **Stereo Balance (`stereo_balance`)**
 - Determines how **divergence is distributed** between the two eyes.
-- `0.0` = Even distribution  
+- `0.0` = Even distribution
 - Positive/negative values shift the effect toward one eye.
+
+#### **Convergence Point (`convergence_point`)** 🆕
+- Controls which depth level appears **at screen plane** (zero parallax).
+- `0.0` = Nearest depth at screen → All content **recedes behind screen**
+- `0.5` = Mid-depth at screen → **Balanced effect** (default)
+- `1.0` = Furthest depth at screen → All content **pops out toward viewer**
+
+**Use cases:**
+- **Pop-out mode** (`1.0`): Product displays, comics, UI elements that should float forward
+- **Window mode** (`0.0`): Subtle depth, everything recedes naturally
+- **Portrait mode** (`0.6-0.7`): Face at screen, background recedes
+- **Landscape mode** (`0.3-0.4`): Foreground pops slightly, horizon recedes
 
 #### **Stereo Offset Exponent (`stereo_offset_exponent`)**
 - Adjusts **depth-to-offset mapping**, influencing how depth values are converted into horizontal shifts.

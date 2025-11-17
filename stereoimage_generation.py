@@ -251,11 +251,11 @@ def directional_motion_blur(depth, blur_strength, edge_threshold, blur_mask_widt
 def create_stereoimages(original_image, depthmap, divergence, separation=0.0, modes=None,
                         stereo_balance=0.0, stereo_offset_exponent=1.0, fill_technique='polylines_sharp',
                         depth_blur_strength=0.0, depth_blur_edge_threshold=6.0,
-                        direction_aware_depth_blur=False, return_modified_depth=True):
+                        direction_aware_depth_blur=False, return_modified_depth=True, convergence_point=0.5):
                             
     """
     Creates stereoscopic images.
-    
+
     Parameters:
       - original_image: The source image.
       - depthmap: A depth map (white = near, black = far).
@@ -271,6 +271,10 @@ def create_stereoimages(original_image, depthmap, divergence, separation=0.0, mo
             one for the left eye (blurring only on positive horizontal gradients)
             and one for the right eye (blurring only on negative horizontal gradients).
       - return_modified_depth: If True, return the modified depth maps as well.
+      - convergence_point: Controls which depth appears at screen plane (0.0-1.0).
+            0.0 = nearest depth at screen (all content recedes behind screen)
+            0.5 = mid-depth at screen (balanced - default)
+            1.0 = furthest depth at screen (all content pops out toward viewer)
 
     Returns:
       If return_modified_depth is True and direction_aware_depth_blur is True, a tuple
@@ -357,10 +361,10 @@ def create_stereoimages(original_image, depthmap, divergence, separation=0.0, mo
 
     left_eye = original_image if left_divergence < 0.001 else \
         apply_stereo_divergence(original_image, left_depthmap, +1 * left_divergence, -1 * separation,
-                                stereo_offset_exponent, fill_technique)
+                                stereo_offset_exponent, fill_technique, convergence_point)
     right_eye = original_image if right_divergence < 0.001 else \
         apply_stereo_divergence(original_image, right_depthmap, -1 * right_divergence, separation,
-                                stereo_offset_exponent, fill_technique)
+                                stereo_offset_exponent, fill_technique, convergence_point)
     
     results = []
     for mode in modes:
@@ -395,9 +399,15 @@ def create_stereoimages(original_image, depthmap, divergence, separation=0.0, mo
     else:
         return stereo_images
 
-def apply_stereo_divergence(original_image, depth, divergence, separation, stereo_offset_exponent, fill_technique):
+def apply_stereo_divergence(original_image, depth, divergence, separation, stereo_offset_exponent, fill_technique, convergence_point=0.5):
     """
     Dispatches to the desired stereo mapping algorithm.
+
+    Parameters:
+        convergence_point: Controls which depth appears at screen plane (0.0-1.0)
+                          0.0 = nearest depth at screen (all content recedes)
+                          0.5 = mid-depth at screen (balanced, default)
+                          1.0 = furthest depth at screen (all content pops out)
     """
     assert original_image.shape[:2] == depth.shape, 'Depthmap and the image must have the same size'
     depth_min = depth.min()
@@ -408,6 +418,12 @@ def apply_stereo_divergence(original_image, depth, divergence, separation, stere
         normalized_depth = np.zeros_like(depth)
     else:
         normalized_depth = (depth - depth_min) / (depth_max - depth_min)
+
+    # Apply convergence point: shift the depth range so convergence_point maps to 0
+    # Objects at convergence_point depth will have zero parallax (appear at screen)
+    # Objects closer will have positive parallax (pop out)
+    # Objects further will have negative parallax (recede)
+    normalized_depth = normalized_depth - convergence_point
 
     divergence_px = (divergence / 100.0) * original_image.shape[1]
     separation_px = (separation / 100.0) * original_image.shape[1]
