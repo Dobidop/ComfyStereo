@@ -368,9 +368,12 @@ class StereoImageNode:
             if img.shape[:2] != dm.shape:
                 dm = np.array(Image.fromarray(dm).resize((img.shape[1], img.shape[0])))
             
-            output = sig.create_stereoimages(img, dm, divergence, separation,  
-                                             [modes], stereo_balance, stereo_offset_exponent, 
-                                             fill_technique, 5, depth_blur_edge_threshold, depth_map_blur)
+            # Use divergence as depth_blur_strength for directional motion blur
+            depth_blur_strength = divergence if depth_map_blur else 0
+
+            output = sig.create_stereoimages(img, dm, divergence, separation,
+                                             [modes], stereo_balance, stereo_offset_exponent,
+                                             fill_technique, depth_blur_strength, depth_blur_edge_threshold, depth_map_blur)
 
             
             if len(output) == 3:

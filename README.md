@@ -36,7 +36,7 @@ New functionality includes **edge-aware and direction-aware blurring** of the de
 ### **Depth map blurring:**
 - **Reduces artifacts and harsh transitions** in the final stereo image, especially at **higher divergence settings**.
 - **Trade-off**: It **increases computation time** (5-25%). If speed is a concern, you may want to disable it.
-- `depth_map_threshhold` sets the depth map gradient sharpness application cutoff. Low values will apply the blur to more shallow gradients, blurring the depth map more broadly (which can negativbely affect the end result). Higher values isolates the steeper gradients.
+- `depth_map_threshold` sets the depth map gradient sharpness application cutoff. Low values will apply the blur to more shallow gradients, blurring the depth map more broadly (which can negatively affect the end result). Higher values isolates the steeper gradients.
 
 ### **How to Enable Adaptive Blurring**
 - Set `'depth_map_blur' = True`.

@@ -219,7 +219,7 @@ def create_stereoimages(original_image, depthmap, divergence, separation=0.0, mo
     depthmap = np.asarray(depthmap).astype(np.float64)
     
     if direction_aware_depth_blur:
-        left_depthmap, right_depthmap = directional_motion_blur(depthmap, divergence, depth_blur_edge_threshold, divergence)
+        left_depthmap, right_depthmap = directional_motion_blur(depthmap, depth_blur_strength, depth_blur_edge_threshold, depth_blur_strength)
 
     else:
         # Global edge-selective blur (as before)
@@ -234,12 +234,18 @@ def create_stereoimages(original_image, depthmap, divergence, separation=0.0, mo
     else:
         mod_depth = depthmap.copy()
     
-    balance = (stereo_balance + 1) / 2
-    left_eye = original_image if balance < 0.001 else \
-        apply_stereo_divergence(original_image, left_depthmap, +1 * divergence, -1 * separation,
+    # Calculate balanced divergence for each eye
+    # When stereo_balance = 0: both eyes get equal divergence (neutral)
+    # When stereo_balance < 0: left eye gets more effect
+    # When stereo_balance > 0: right eye gets more effect
+    left_divergence = divergence * (1 + stereo_balance)
+    right_divergence = divergence * (1 - stereo_balance)
+
+    left_eye = original_image if left_divergence < 0.001 else \
+        apply_stereo_divergence(original_image, left_depthmap, +1 * left_divergence, -1 * separation,
                                 stereo_offset_exponent, fill_technique)
-    right_eye = original_image if balance > 0.999 else \
-        apply_stereo_divergence(original_image, right_depthmap, -1 * divergence, separation,
+    right_eye = original_image if right_divergence < 0.001 else \
+        apply_stereo_divergence(original_image, right_depthmap, -1 * right_divergence, separation,
                                 stereo_offset_exponent, fill_technique)
     
     results = []
