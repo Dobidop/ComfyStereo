@@ -359,19 +359,35 @@ class StereoImageNode:
         pbar = ProgressBar(total_steps)
         
         for i in range(len(image)):
-            img = tensor2np(image[i:i+1])
-            dm = tensor2np(depth_map[i:i+1])
-        
-            if len(dm.shape) == 3 and dm.shape[2] == 3:
-                dm = np.dot(dm[..., :3], [0.2989, 0.5870, 0.1140]).astype(np.uint8)
-            
-            if img.shape[:2] != dm.shape:
-                dm = np.array(Image.fromarray(dm).resize((img.shape[1], img.shape[0])))
-            
+            # Keep as tensors for GPU acceleration
+            img_tensor = image[i]  # [C, H, W] or [H, W, C]
+            dm_tensor = depth_map[i]  # [C, H, W] or [H, W, C]
+
+            # Ensure correct format [C, H, W] for processing
+            if img_tensor.dim() == 2:
+                img_tensor = img_tensor.unsqueeze(0)
+            if dm_tensor.dim() == 2:
+                dm_tensor = dm_tensor.unsqueeze(0)
+
+            # Convert RGB depth map to grayscale if needed
+            if dm_tensor.shape[0] == 3:
+                dm_tensor = 0.2989 * dm_tensor[0] + 0.5870 * dm_tensor[1] + 0.1140 * dm_tensor[2]
+            else:
+                dm_tensor = dm_tensor.squeeze(0)
+
+            # Resize depth map if needed
+            if img_tensor.shape[1:] != dm_tensor.shape:
+                dm_tensor = torch.nn.functional.interpolate(
+                    dm_tensor.unsqueeze(0).unsqueeze(0),
+                    size=img_tensor.shape[1:],
+                    mode='bilinear',
+                    align_corners=False
+                ).squeeze()
+
             # Use divergence as depth_blur_strength for directional motion blur
             depth_blur_strength = divergence if depth_map_blur else 0
 
-            output = sig.create_stereoimages(img, dm, divergence, separation,
+            output = sig.create_stereoimages(img_tensor, dm_tensor, divergence, separation,
                                              [modes], stereo_balance, stereo_offset_exponent,
                                              fill_technique, depth_blur_strength, depth_blur_edge_threshold, depth_map_blur)
 

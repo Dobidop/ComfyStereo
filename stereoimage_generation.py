@@ -10,6 +10,85 @@ import numpy as np
 from PIL import Image
 import math
 from scipy.ndimage import convolve1d, binary_dilation, sobel
+import torch
+import torch.nn.functional as F
+
+# GPU availability check
+CUDA_AVAILABLE = torch.cuda.is_available()
+
+def directional_motion_blur_gpu(depth_tensor, blur_strength, edge_threshold, blur_mask_width=5):
+    """
+    GPU-accelerated directional motion blur for depth maps using PyTorch.
+
+    Parameters:
+        depth_tensor (torch.Tensor): Input depth map [H, W] or [1, 1, H, W]
+        blur_strength (float): Width of the blur
+        edge_threshold (float): Edge detection threshold
+        blur_mask_width (float): How wide the mask should be
+
+    Returns:
+        left_blurred (torch.Tensor): Depth map modified for the left eye
+        right_blurred (torch.Tensor): Depth map modified for the right eye
+    """
+    if blur_strength <= 0:
+        return depth_tensor, depth_tensor
+
+    # Ensure tensor is on GPU if available
+    device = depth_tensor.device if depth_tensor.is_cuda else ('cuda' if CUDA_AVAILABLE else 'cpu')
+    depth_tensor = depth_tensor.to(device)
+
+    # Ensure 4D tensor [B, C, H, W]
+    if depth_tensor.dim() == 2:
+        depth_tensor = depth_tensor.unsqueeze(0).unsqueeze(0)
+    elif depth_tensor.dim() == 3:
+        depth_tensor = depth_tensor.unsqueeze(0)
+
+    blur_strength = int(round(blur_strength))
+
+    # Compute horizontal gradient using Sobel filtering
+    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
+                           dtype=depth_tensor.dtype, device=device).unsqueeze(0).unsqueeze(0)
+    grad_x = F.conv2d(depth_tensor, sobel_x, padding=1)
+
+    # Compute edge strength
+    edge_strength = torch.abs(grad_x) / (10 * edge_threshold)
+    edge_strength = torch.clamp(edge_strength, 0, 1)
+
+    # Create separate edge masks
+    left_edge_mask = (grad_x > 0) & (edge_strength > 0.5)
+    right_edge_mask = (grad_x < 0) & (edge_strength > 0.5)
+
+    # Dilation for mask expansion
+    mask_radius = int(blur_mask_width)
+    dilation_kernel = torch.ones((1, 1, 1, mask_radius), dtype=torch.float32, device=device)
+
+    # Apply dilation (approximate with max pooling)
+    left_dilated_mask = F.max_pool2d(left_edge_mask.float(),
+                                      kernel_size=(1, mask_radius),
+                                      stride=1,
+                                      padding=(0, mask_radius//2)) > 0.5
+    right_dilated_mask = F.max_pool2d(right_edge_mask.float(),
+                                       kernel_size=(1, mask_radius),
+                                       stride=1,
+                                       padding=(0, mask_radius//2)) > 0.5
+
+    # Create horizontal motion blur kernel
+    blur_kernel = torch.ones((1, 1, 1, blur_strength), device=device) / blur_strength
+
+    # Apply motion blur
+    blurred_depth_left = F.conv2d(depth_tensor, blur_kernel, padding=(0, blur_strength//2))
+    blurred_depth_right = F.conv2d(depth_tensor, torch.flip(blur_kernel, [3]), padding=(0, blur_strength//2))
+
+    # Initialize output
+    left_blurred = depth_tensor.clone()
+    right_blurred = depth_tensor.clone()
+
+    # Apply blur only in masked regions
+    left_blurred = torch.where(left_dilated_mask, blurred_depth_left, left_blurred)
+    right_blurred = torch.where(right_dilated_mask, blurred_depth_right, right_blurred)
+
+    # Return in original shape
+    return left_blurred.squeeze(), right_blurred.squeeze()
 
 def blur_depth_map(depth, sigma):
     """
@@ -206,22 +285,69 @@ def create_stereoimages(original_image, depthmap, divergence, separation=0.0, mo
         modes = [modes]
     if len(modes) == 0:
         return []
-    
-    original_image = np.asarray(original_image)
-    depthmap = np.asarray(depthmap).astype(np.float64)
-    
-    if direction_aware_depth_blur:
-        left_depthmap, right_depthmap = directional_motion_blur(depthmap, depth_blur_strength, depth_blur_edge_threshold, depth_blur_strength)
-    else:
-        left_depthmap = right_depthmap = depthmap
 
-    # Save modified depth maps for output.
-    if direction_aware_depth_blur:
-        mod_left = left_depthmap.copy()
-        mod_right = right_depthmap.copy()
+    # Check if inputs are torch tensors (GPU acceleration path)
+    use_gpu = isinstance(depthmap, torch.Tensor) and isinstance(original_image, torch.Tensor)
+
+    if use_gpu:
+        # GPU-accelerated path - keep tensors on device
+        # Ensure grayscale depth map [H, W]
+        if depthmap.dim() == 3:
+            depthmap = depthmap.squeeze()
+
+        # Normalize depth map to 0-255 range for processing (ComfyUI tensors are 0-1)
+        if depthmap.max() <= 1.0:
+            depthmap = depthmap * 255.0
+
+        if direction_aware_depth_blur:
+            left_depthmap, right_depthmap = directional_motion_blur_gpu(
+                depthmap, depth_blur_strength, depth_blur_edge_threshold, depth_blur_strength
+            )
+        else:
+            left_depthmap = right_depthmap = depthmap
     else:
-        mod_depth = depthmap.copy()
-    
+        # CPU path - convert to numpy
+        original_image = np.asarray(original_image)
+        depthmap = np.asarray(depthmap).astype(np.float64)
+
+        if direction_aware_depth_blur:
+            left_depthmap, right_depthmap = directional_motion_blur(
+                depthmap, depth_blur_strength, depth_blur_edge_threshold, depth_blur_strength
+            )
+        else:
+            left_depthmap = right_depthmap = depthmap
+
+    # Convert to numpy for stereo shift operations (JIT-compiled functions need numpy)
+    if use_gpu:
+        # Convert depth maps to numpy for processing
+        left_depthmap_np = left_depthmap.cpu().numpy() if left_depthmap.is_cuda else left_depthmap.numpy()
+        right_depthmap_np = right_depthmap.cpu().numpy() if right_depthmap.is_cuda else right_depthmap.numpy()
+        original_image_np = original_image.cpu().numpy() if original_image.is_cuda else original_image.numpy()
+
+        # Ensure proper format [H, W, C]
+        if original_image_np.ndim == 3 and original_image_np.shape[0] == 3:
+            original_image_np = original_image_np.transpose(1, 2, 0)
+        original_image_np = (np.clip(original_image_np * 255, 0, 255)).astype(np.uint8)
+
+        # Save modified depth maps for output
+        if direction_aware_depth_blur:
+            mod_left = (left_depthmap_np * 255).astype(np.uint8)
+            mod_right = (right_depthmap_np * 255).astype(np.uint8)
+        else:
+            mod_depth_np = depthmap.cpu().numpy() if depthmap.is_cuda else depthmap.numpy()
+            mod_depth = (mod_depth_np * 255).astype(np.uint8)
+
+        left_depthmap = left_depthmap_np
+        right_depthmap = right_depthmap_np
+        original_image = original_image_np
+    else:
+        # Save modified depth maps for output (numpy path)
+        if direction_aware_depth_blur:
+            mod_left = left_depthmap.copy()
+            mod_right = right_depthmap.copy()
+        else:
+            mod_depth = depthmap.copy()
+
     # Calculate balanced divergence for each eye
     # When stereo_balance = 0: both eyes get equal divergence (neutral)
     # When stereo_balance > 0: left eye gets more effect (left_divergence increases)

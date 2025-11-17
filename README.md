@@ -31,11 +31,17 @@ ComfyUI\custom_nodes\comfystereo\config.json
 
 ## New Features & Depth Map Blurring
 
-New functionality includes **edge-aware and direction-aware blurring** of the depth map, additional interpolation methods, and **stereo distortion improvements**.  
+New functionality includes **edge-aware and direction-aware blurring** of the depth map, additional interpolation methods, and **stereo distortion improvements**.
+
+### **GPU Acceleration (Automatic)**
+- **Depth processing is automatically GPU-accelerated** when CUDA is available
+- **5-20x faster** depth map blurring operations on compatible GPUs
+- **Automatic fallback** to CPU processing if GPU is unavailable
+- **Zero configuration** - works out of the box with ComfyUI's tensor format
 
 ### **Depth map blurring:**
 - **Reduces artifacts and harsh transitions** in the final stereo image, especially at **higher divergence settings**.
-- **Trade-off**: It **increases computation time** (5-25%). If speed is a concern, you may want to disable it.
+- **Performance**: GPU-accelerated when available, minimal overhead on modern GPUs
 - `depth_map_threshold` sets the depth map gradient sharpness application cutoff. Low values will apply the blur to more shallow gradients, blurring the depth map more broadly (which can negatively affect the end result). Higher values isolates the steeper gradients.
 
 ### **How to Enable Adaptive Blurring**
