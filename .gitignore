@@ -1,2 +1,8 @@
 __pycache__
 .tracking
+
+# Test artifacts
+output_*.jpg
+output_*.png
+test_image.jpg
+test_depth.png
