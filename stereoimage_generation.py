@@ -63,6 +63,7 @@ def directional_motion_blur_gpu(depth_tensor, blur_strength, edge_threshold, blu
     dilation_kernel = torch.ones((1, 1, 1, mask_radius), dtype=torch.float32, device=device)
 
     # Apply dilation (approximate with max pooling)
+    # Ensure output size matches input by cropping if needed
     left_dilated_mask = F.max_pool2d(left_edge_mask.float(),
                                       kernel_size=(1, mask_radius),
                                       stride=1,
@@ -78,6 +79,13 @@ def directional_motion_blur_gpu(depth_tensor, blur_strength, edge_threshold, blu
     # Apply motion blur
     blurred_depth_left = F.conv2d(depth_tensor, blur_kernel, padding=(0, blur_strength//2))
     blurred_depth_right = F.conv2d(depth_tensor, torch.flip(blur_kernel, [3]), padding=(0, blur_strength//2))
+
+    # Ensure all tensors have the same size by cropping to the smallest dimension
+    target_shape = depth_tensor.shape
+    left_dilated_mask = left_dilated_mask[..., :target_shape[2], :target_shape[3]]
+    right_dilated_mask = right_dilated_mask[..., :target_shape[2], :target_shape[3]]
+    blurred_depth_left = blurred_depth_left[..., :target_shape[2], :target_shape[3]]
+    blurred_depth_right = blurred_depth_right[..., :target_shape[2], :target_shape[3]]
 
     # Initialize output
     left_blurred = depth_tensor.clone()
