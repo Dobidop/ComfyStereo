@@ -360,21 +360,30 @@ class StereoImageNode:
         pbar = ProgressBar(total_steps)
         
         for i in range(len(image)):
-            # Keep as tensors for GPU acceleration
-            img_tensor = image[i]  # [C, H, W] or [H, W, C]
-            dm_tensor = depth_map[i]  # [C, H, W] or [H, W, C]
+            # ComfyUI uses [H, W, C] format, convert to [C, H, W] for processing
+            img_tensor = image[i]  # [H, W, C]
+            dm_tensor = depth_map[i]  # [H, W, C]
 
-            # Ensure correct format [C, H, W] for processing
-            if img_tensor.dim() == 2:
-                img_tensor = img_tensor.unsqueeze(0)
-            if dm_tensor.dim() == 2:
-                dm_tensor = dm_tensor.unsqueeze(0)
+            # Convert from [H, W, C] to [C, H, W] format
+            if img_tensor.dim() == 3 and img_tensor.shape[2] in [1, 3]:
+                img_tensor = img_tensor.permute(2, 0, 1)  # [H, W, C] -> [C, H, W]
+            elif img_tensor.dim() == 2:
+                img_tensor = img_tensor.unsqueeze(0)  # [H, W] -> [1, H, W]
 
-            # Convert RGB depth map to grayscale if needed
+            if dm_tensor.dim() == 3 and dm_tensor.shape[2] in [1, 3]:
+                dm_tensor = dm_tensor.permute(2, 0, 1)  # [H, W, C] -> [C, H, W]
+            elif dm_tensor.dim() == 2:
+                dm_tensor = dm_tensor.unsqueeze(0)  # [H, W] -> [1, H, W]
+
+            # Convert RGB depth map to grayscale if needed (now in [C, H, W] format)
             if dm_tensor.shape[0] == 3:
                 dm_tensor = 0.2989 * dm_tensor[0] + 0.5870 * dm_tensor[1] + 0.1140 * dm_tensor[2]
-            else:
+            elif dm_tensor.shape[0] == 1:
                 dm_tensor = dm_tensor.squeeze(0)
+
+            # Ensure dm_tensor is 2D at this point
+            if dm_tensor.dim() > 2:
+                dm_tensor = dm_tensor.squeeze()
 
             # Resize depth map if needed
             if img_tensor.shape[1:] != dm_tensor.shape:
