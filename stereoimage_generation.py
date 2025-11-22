@@ -16,6 +16,324 @@ import torch.nn.functional as F
 # GPU availability check
 CUDA_AVAILABLE = torch.cuda.is_available()
 
+
+def apply_stereo_divergence_gpu(image_tensor, depth_tensor, divergence_px, separation_px,
+                                 stereo_offset_exponent, convergence_point=0.5):
+    """
+    GPU-accelerated stereo divergence using PyTorch grid_sample.
+
+    This function warps the image based on the depth map to create stereo views.
+    It runs entirely on GPU, avoiding CPU-GPU memory transfers.
+
+    Parameters:
+        image_tensor (torch.Tensor): Input image [C, H, W] or [H, W, C], values 0-1
+        depth_tensor (torch.Tensor): Depth map [H, W], values 0-1 (or 0-255, will be normalized)
+        divergence_px (float): Divergence in pixels (positive = shift right, negative = shift left)
+        separation_px (float): Additional separation in pixels
+        stereo_offset_exponent (float): Exponent for depth-to-offset mapping
+        convergence_point (float): Which depth appears at screen plane (0.0-1.0)
+
+    Returns:
+        torch.Tensor: Warped image [C, H, W], values 0-1
+    """
+    device = depth_tensor.device if depth_tensor.is_cuda else ('cuda' if CUDA_AVAILABLE else 'cpu')
+
+    # Ensure image is on the right device and in [C, H, W] format
+    image_tensor = image_tensor.to(device)
+    depth_tensor = depth_tensor.to(device)
+
+    # Handle image format - ensure [C, H, W]
+    if image_tensor.dim() == 3:
+        if image_tensor.shape[2] in [1, 3, 4]:  # [H, W, C] format
+            image_tensor = image_tensor.permute(2, 0, 1)
+
+    C, H, W = image_tensor.shape
+
+    # Ensure depth is 2D [H, W]
+    if depth_tensor.dim() == 3:
+        depth_tensor = depth_tensor.squeeze()
+    if depth_tensor.dim() == 1:
+        depth_tensor = depth_tensor.view(H, W)
+
+    # Normalize depth to 0-1 range if needed
+    depth_min = depth_tensor.min()
+    depth_max = depth_tensor.max()
+    if depth_max > 1.0:
+        depth_tensor = depth_tensor / 255.0
+        depth_min = depth_tensor.min()
+        depth_max = depth_tensor.max()
+
+    # Normalize depth map to 0-1 range
+    if depth_max - depth_min > 1e-6:
+        normalized_depth = (depth_tensor - depth_min) / (depth_max - depth_min)
+    else:
+        normalized_depth = torch.zeros_like(depth_tensor)
+
+    # Apply convergence point offset
+    normalized_depth = normalized_depth - convergence_point
+
+    # Apply stereo offset exponent
+    # Handle negative values from convergence point shift
+    sign = torch.sign(normalized_depth)
+    abs_depth = torch.abs(normalized_depth)
+    offset_depth = sign * torch.pow(abs_depth, stereo_offset_exponent)
+
+    # Calculate pixel offsets
+    pixel_offset = offset_depth * divergence_px + separation_px
+
+    # Convert pixel offset to normalized coordinates (-1 to 1)
+    # grid_sample uses normalized coords where -1 is left edge, +1 is right edge
+    offset_normalized = pixel_offset / (W / 2)
+
+    # Create sampling grid
+    # Base grid: regular pixel coordinates normalized to [-1, 1]
+    y_coords = torch.linspace(-1, 1, H, device=device)
+    x_coords = torch.linspace(-1, 1, W, device=device)
+    grid_y, grid_x = torch.meshgrid(y_coords, x_coords, indexing='ij')
+
+    # Apply horizontal offset to x coordinates
+    # We sample FROM the offset position, so we subtract the offset
+    grid_x_warped = grid_x - offset_normalized
+
+    # Stack into grid format [1, H, W, 2]
+    grid = torch.stack([grid_x_warped, grid_y], dim=-1).unsqueeze(0)
+
+    # Add batch dimension to image [1, C, H, W]
+    image_batch = image_tensor.unsqueeze(0)
+
+    # Perform the warp using grid_sample
+    # padding_mode='border' repeats edge pixels for out-of-bounds samples
+    # This provides automatic "fill" for gaps
+    warped = F.grid_sample(
+        image_batch,
+        grid,
+        mode='bilinear',
+        padding_mode='border',
+        align_corners=True
+    )
+
+    # Remove batch dimension and return [C, H, W]
+    return warped.squeeze(0)
+
+
+def apply_stereo_divergence_gpu_with_fill(image_tensor, depth_tensor, divergence_px, separation_px,
+                                           stereo_offset_exponent, convergence_point=0.5, fill_mode='border'):
+    """
+    GPU-accelerated stereo divergence with configurable fill modes.
+
+    Parameters:
+        fill_mode: 'border' (repeat edges), 'zeros' (black fill), 'reflection' (mirror)
+
+    Returns:
+        tuple: (warped_image [C,H,W], mask [H,W] indicating valid pixels)
+    """
+    device = depth_tensor.device if depth_tensor.is_cuda else ('cuda' if CUDA_AVAILABLE else 'cpu')
+
+    image_tensor = image_tensor.to(device)
+    depth_tensor = depth_tensor.to(device)
+
+    # Handle image format - ensure [C, H, W]
+    if image_tensor.dim() == 3:
+        if image_tensor.shape[2] in [1, 3, 4]:
+            image_tensor = image_tensor.permute(2, 0, 1)
+
+    C, H, W = image_tensor.shape
+
+    # Ensure depth is 2D
+    if depth_tensor.dim() == 3:
+        depth_tensor = depth_tensor.squeeze()
+
+    # Normalize depth
+    depth_min = depth_tensor.min()
+    depth_max = depth_tensor.max()
+    if depth_max > 1.0:
+        depth_tensor = depth_tensor / 255.0
+        depth_min = depth_tensor.min()
+        depth_max = depth_tensor.max()
+
+    if depth_max - depth_min > 1e-6:
+        normalized_depth = (depth_tensor - depth_min) / (depth_max - depth_min)
+    else:
+        normalized_depth = torch.zeros_like(depth_tensor)
+
+    normalized_depth = normalized_depth - convergence_point
+
+    # Apply exponent with sign preservation
+    sign = torch.sign(normalized_depth)
+    abs_depth = torch.abs(normalized_depth)
+    offset_depth = sign * torch.pow(abs_depth, stereo_offset_exponent)
+
+    pixel_offset = offset_depth * divergence_px + separation_px
+    offset_normalized = pixel_offset / (W / 2)
+
+    # Create sampling grid
+    y_coords = torch.linspace(-1, 1, H, device=device)
+    x_coords = torch.linspace(-1, 1, W, device=device)
+    grid_y, grid_x = torch.meshgrid(y_coords, x_coords, indexing='ij')
+
+    grid_x_warped = grid_x - offset_normalized
+    grid = torch.stack([grid_x_warped, grid_y], dim=-1).unsqueeze(0)
+
+    image_batch = image_tensor.unsqueeze(0)
+
+    # Map fill mode to grid_sample padding mode
+    padding_mode_map = {
+        'border': 'border',
+        'zeros': 'zeros',
+        'reflection': 'reflection'
+    }
+    padding_mode = padding_mode_map.get(fill_mode, 'border')
+
+    warped = F.grid_sample(
+        image_batch,
+        grid,
+        mode='bilinear',
+        padding_mode=padding_mode,
+        align_corners=True
+    )
+
+    # Create mask of valid (in-bounds) pixels
+    # A pixel is valid if its source x coordinate is within [-1, 1]
+    valid_mask = (grid_x_warped >= -1) & (grid_x_warped <= 1)
+
+    return warped.squeeze(0), valid_mask
+
+
+def create_stereoimages_gpu(image_tensor, depth_tensor, divergence, separation=0.0, modes=None,
+                            stereo_balance=0.0, stereo_offset_exponent=1.0, convergence_point=0.5,
+                            depth_blur_strength=0.0, depth_blur_edge_threshold=6.0,
+                            direction_aware_depth_blur=False):
+    """
+    Fully GPU-accelerated stereo image generation.
+
+    This function keeps all processing on the GPU, avoiding expensive CPU-GPU transfers.
+    Uses grid_sample for fast hardware-accelerated image warping.
+
+    Parameters:
+        image_tensor (torch.Tensor): Input image [C, H, W] or [H, W, C], values 0-1
+        depth_tensor (torch.Tensor): Depth map [H, W] or [C, H, W], values 0-1
+        divergence (float): 3D effect strength in percentages
+        separation (float): Additional horizontal shift percentage
+        modes (list): Output modes ('left-right', 'top-bottom', etc.)
+        stereo_balance (float): How divergence is split between eyes
+        stereo_offset_exponent (float): Exponent for depth mapping
+        convergence_point (float): Which depth appears at screen plane (0.0-1.0)
+        depth_blur_strength (float): Blur strength for depth edges
+        depth_blur_edge_threshold (float): Edge detection threshold
+        direction_aware_depth_blur (bool): Use directional blur for left/right eyes
+
+    Returns:
+        tuple: (list of stereo images as tensors, left_depth, right_depth)
+    """
+    if modes is None:
+        modes = ['left-right']
+    if not isinstance(modes, list):
+        modes = [modes]
+    if len(modes) == 0:
+        return [], None, None
+
+    device = depth_tensor.device if depth_tensor.is_cuda else ('cuda' if CUDA_AVAILABLE else 'cpu')
+
+    image_tensor = image_tensor.to(device)
+    depth_tensor = depth_tensor.to(device)
+
+    # Ensure image is [C, H, W]
+    if image_tensor.dim() == 3:
+        if image_tensor.shape[2] in [1, 3, 4]:
+            image_tensor = image_tensor.permute(2, 0, 1)
+
+    C, H, W = image_tensor.shape
+
+    # Ensure depth is [H, W]
+    if depth_tensor.dim() == 3:
+        if depth_tensor.shape[0] == 3:  # RGB depth map
+            depth_tensor = 0.2989 * depth_tensor[0] + 0.5870 * depth_tensor[1] + 0.1140 * depth_tensor[2]
+        else:
+            depth_tensor = depth_tensor.squeeze()
+
+    # Normalize depth to 0-255 range for blur function compatibility
+    if depth_tensor.max() <= 1.0:
+        depth_tensor = depth_tensor * 255.0
+
+    # Apply directional depth blur if enabled
+    if direction_aware_depth_blur and depth_blur_strength > 0:
+        left_depth, right_depth = directional_motion_blur_gpu(
+            depth_tensor, depth_blur_strength, depth_blur_edge_threshold, depth_blur_strength
+        )
+    else:
+        left_depth = depth_tensor
+        right_depth = depth_tensor
+
+    # Calculate divergence in pixels
+    divergence_px = (divergence / 100.0) * W
+    separation_px = (separation / 100.0) * W
+
+    # Calculate balanced divergence for each eye
+    left_divergence = divergence * (1 + stereo_balance)
+    right_divergence = divergence * (1 - stereo_balance)
+
+    left_divergence_px = (left_divergence / 100.0) * W
+    right_divergence_px = (right_divergence / 100.0) * W
+
+    # Generate left and right eye views using GPU warping
+    if left_divergence < 0.001:
+        left_eye = image_tensor
+    else:
+        left_eye = apply_stereo_divergence_gpu(
+            image_tensor, left_depth,
+            +left_divergence_px, -separation_px,
+            stereo_offset_exponent, convergence_point
+        )
+
+    if right_divergence < 0.001:
+        right_eye = image_tensor
+    else:
+        right_eye = apply_stereo_divergence_gpu(
+            image_tensor, right_depth,
+            -right_divergence_px, separation_px,
+            stereo_offset_exponent, convergence_point
+        )
+
+    # Generate output modes
+    results = []
+    for mode in modes:
+        if mode == 'left-right':
+            result = torch.cat([left_eye, right_eye], dim=2)  # Horizontal concat on width
+        elif mode == 'right-left':
+            result = torch.cat([right_eye, left_eye], dim=2)
+        elif mode == 'top-bottom':
+            result = torch.cat([left_eye, right_eye], dim=1)  # Vertical concat on height
+        elif mode == 'bottom-top':
+            result = torch.cat([right_eye, left_eye], dim=1)
+        elif mode == 'red-cyan-anaglyph':
+            # Red channel from left, green+blue from right
+            result = torch.stack([
+                left_eye[0],   # Red from left
+                right_eye[1],  # Green from right
+                right_eye[2]   # Blue from right
+            ], dim=0)
+        elif mode == 'left-only':
+            result = left_eye
+        elif mode == 'only-right':
+            result = right_eye
+        elif mode == 'cyan-red-reverseanaglyph':
+            result = torch.stack([
+                right_eye[0],
+                left_eye[1],
+                left_eye[2]
+            ], dim=0)
+        else:
+            raise ValueError(f'Unknown mode: {mode}')
+
+        results.append(result)
+
+    # Normalize depth maps for output (0-1 range)
+    left_depth_out = left_depth / 255.0 if left_depth.max() > 1.0 else left_depth
+    right_depth_out = right_depth / 255.0 if right_depth.max() > 1.0 else right_depth
+
+    return results, left_depth_out, right_depth_out
+
+
 def directional_motion_blur_gpu(depth_tensor, blur_strength, edge_threshold, blur_mask_width=5):
     """
     GPU-accelerated directional motion blur for depth maps using PyTorch.
@@ -113,14 +431,14 @@ def blur_depth_map(depth, sigma):
     
     h, w = depth.shape
     # Horizontal pass
-    blurred = np.empty_like(depth, dtype=np.float64)
+    blurred = np.empty_like(depth, dtype=np.float32)
     for i in range(h):
         row = depth[i, :]
         padded = np.pad(row, (radius, radius), mode='edge')
         conv = np.convolve(padded, kernel, mode='valid')
         blurred[i, :] = conv
     # Vertical pass
-    final = np.empty_like(blurred, dtype=np.float64)
+    final = np.empty_like(blurred, dtype=np.float32)
     for j in range(w):
         col = blurred[:, j]
         padded = np.pad(col, (radius, radius), mode='edge')
@@ -320,7 +638,7 @@ def create_stereoimages(original_image, depthmap, divergence, separation=0.0, mo
     else:
         # CPU path - convert to numpy
         original_image = np.asarray(original_image)
-        depthmap = np.asarray(depthmap).astype(np.float64)
+        depthmap = np.asarray(depthmap).astype(np.float32)
 
         if direction_aware_depth_blur:
             left_depthmap, right_depthmap = directional_motion_blur(
@@ -460,8 +778,8 @@ def enhanced_inverse_mapping_with_mask(original_image, normalized_depth, diverge
     using a Gaussian kernel. Returns both the accumulated image and a binary mask.
     """
     h, w, c = original_image.shape
-    accum = np.zeros((h, w, c), dtype=np.float64)
-    weight_sum = np.zeros((h, w), dtype=np.float64)
+    accum = np.zeros((h, w, c), dtype=np.float32)
+    weight_sum = np.zeros((h, w), dtype=np.float32)
     mask = np.zeros((h, w), dtype=np.uint8)
     sigma = 1.0  # standard deviation for the subpixel kernel
     for row in prange(h):
@@ -521,7 +839,7 @@ def inverse_mapping_with_mask(original_image, normalized_depth, divergence_px: f
     derived_image = np.zeros_like(original_image)
     mask = np.zeros((h, w), dtype=np.uint8)
     for row in prange(h):
-        depth_buffer = np.full(w, -1.0, dtype=np.float64)
+        depth_buffer = np.full(w, -1.0, dtype=np.float32)
         for x in range(w):
             offset = (normalized_depth[row, x] ** stereo_offset_exponent) * divergence_px
             dest_x = x + 0.5 + offset + separation_px
@@ -545,7 +863,7 @@ def apply_stereo_divergence_inverse(original_image, normalized_depth, divergence
     h, w, c = original_image.shape
     derived_image = np.zeros_like(original_image)
     for row in prange(h):
-        depth_buffer = np.full(w, -1.0, dtype=np.float64)
+        depth_buffer = np.full(w, -1.0, dtype=np.float32)
         for x in range(w):
             offset = (normalized_depth[row, x] ** stereo_offset_exponent) * divergence_px
             dest_x = x + 0.5 + offset + separation_px
@@ -575,12 +893,12 @@ def edge_aware_gap_fill(image, mask, guidance, window_size=3, sigma_s=1.0, sigma
     'guidance' is a single-channel (grayscale) image used to preserve edges.
     """
     h, w, c = image.shape
-    filled = image.astype(np.float64).copy()
+    filled = image.astype(np.float32).copy()
     half_win = window_size // 2
     for i in range(h):
         for j in range(w):
             if mask[i, j] == 0:
-                new_val = np.zeros(c, dtype=np.float64)
+                new_val = np.zeros(c, dtype=np.float32)
                 weight_total = 0.0
                 for di in range(-half_win, half_win+1):
                     for dj in range(-half_win, half_win+1):
@@ -593,7 +911,7 @@ def edge_aware_gap_fill(image, mask, guidance, window_size=3, sigma_s=1.0, sigma
                                 diff = guidance[i, j] - guidance[ni, nj]
                                 w_r = math.exp(- (diff*diff) / (2 * sigma_r * sigma_r))
                                 wght = w_s * w_r
-                                new_val += image[ni, nj].astype(np.float64) * wght
+                                new_val += image[ni, nj].astype(np.float32) * wght
                                 weight_total += wght
                 if weight_total > 0:
                     filled[i, j] = new_val / weight_total
@@ -630,15 +948,15 @@ def apply_stereo_divergence_hybrid_edge_plus(original_image, normalized_depth, d
 def apply_stereo_divergence_naive_post(original_image, normalized_depth, divergence_px, separation_px, stereo_offset_exponent):
     base_img, mask = naive_mapping_with_mask(original_image, normalized_depth, divergence_px, separation_px, stereo_offset_exponent)
     h, w, c = base_img.shape
-    output = base_img.astype(np.float64).copy()
+    output = base_img.astype(np.float32).copy()
     for row in range(h):
-        x_coords = np.arange(w, dtype=np.float64)
+        x_coords = np.arange(w, dtype=np.float32)
         valid = np.nonzero(mask[row])[0]
         if valid.size == 0:
             continue
         for ch in range(c):
-            row_data = base_img[row, :, ch].astype(np.float64)
-            interpolated = np.interp(x_coords, valid.astype(np.float64), row_data[valid])
+            row_data = base_img[row, :, ch].astype(np.float32)
+            interpolated = np.interp(x_coords, valid.astype(np.float32), row_data[valid])
             output[row, :, ch] = interpolated
     return output.astype(np.uint8)
 
@@ -646,15 +964,15 @@ def apply_stereo_divergence_naive_post(original_image, normalized_depth, diverge
 def apply_stereo_divergence_inverse_post(original_image, normalized_depth, divergence_px, separation_px, stereo_offset_exponent):
     base_img, mask = inverse_mapping_with_mask(original_image, normalized_depth, divergence_px, separation_px, stereo_offset_exponent)
     h, w, c = base_img.shape
-    output = base_img.astype(np.float64).copy()
+    output = base_img.astype(np.float32).copy()
     for row in range(h):
-        x_coords = np.arange(w, dtype=np.float64)
+        x_coords = np.arange(w, dtype=np.float32)
         valid = np.nonzero(mask[row])[0]
         if valid.size == 0:
             continue
         for ch in range(c):
-            row_data = base_img[row, :, ch].astype(np.float64)
-            interpolated = np.interp(x_coords, valid.astype(np.float64), row_data[valid])
+            row_data = base_img[row, :, ch].astype(np.float32)
+            interpolated = np.interp(x_coords, valid.astype(np.float32), row_data[valid])
             output[row, :, ch] = interpolated
     return output.astype(np.uint8)
 
@@ -710,7 +1028,7 @@ def apply_stereo_divergence_naive(
                 elif sum(r_border) == 0:
                     r_border = l_border
                 total_steps = 1 + r_pointer - l_pointer
-                step = (r_border.astype(np.float64) - l_border) / total_steps
+                step = (r_border.astype(np.float32) - l_border) / total_steps
                 for col in range(l_pointer, r_pointer):
                     derived_image[row][col] = l_border + (step * (col - l_pointer + 1)).astype(np.uint8)
         return derived_image
@@ -740,7 +1058,7 @@ def apply_stereo_divergence_polylines(original_image, normalized_depth, divergen
     h, w, c = original_image.shape
     derived_image = np.zeros_like(original_image)
     for row in prange(h):
-        pt = np.zeros((5 + 2 * w, 3), dtype=np.float64)
+        pt = np.zeros((5 + 2 * w, 3), dtype=np.float32)
         pt_end: int = 0
         pt[pt_end] = [-1.0 * w, 0.0, 0.0]
         pt_end += 1
@@ -757,7 +1075,7 @@ def apply_stereo_divergence_polylines(original_image, normalized_depth, divergen
         pt[pt_end] = [2.0 * w, 0.0, w - 1]
         pt_end += 1
         sg_end: int = pt_end - 1
-        sg = np.zeros((sg_end, 6), dtype=np.float64)
+        sg = np.zeros((sg_end, 6), dtype=np.float32)
         for i in range(sg_end):
             sg[i] += np.concatenate((pt[i], pt[i + 1]))
         for i in range(1, sg_end):
@@ -766,12 +1084,12 @@ def apply_stereo_divergence_polylines(original_image, normalized_depth, divergen
                 pt[u], pt[u + 1] = np.copy(pt[u + 1]), np.copy(pt[u])
                 sg[u], sg[u + 1] = np.copy(sg[u + 1]), np.copy(sg[u])
                 u -= 1
-        csg = np.zeros((5 * int(abs(divergence_px)) + 25, 6), dtype=np.float64)
+        csg = np.zeros((5 * int(abs(divergence_px)) + 25, 6), dtype=np.float32)
         csg_end: int = 0
         sg_pointer: int = 0
         pt_i: int = 0
         for col in range(w):
-            color = np.full(c, 0.5, dtype=np.float64)
+            color = np.full(c, 0.5, dtype=np.float32)
             while pt[pt_i][0] < col:
                 pt_i += 1
             pt_i -= 1
