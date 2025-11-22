@@ -332,10 +332,10 @@ class StereoImageNode:
                 "depth_map": ("IMAGE",),
                 "modes": (["left-right", "right-left", "top-bottom", "bottom-top", "red-cyan-anaglyph"],),
                 "fill_technique": ([
-                    'GPU Warp (Fast)', 'No fill', 'No fill - Reverse projection', 'Imperfect fill - Hybrid Edge', 'Fill - Naive',
-                    'Fill - Naive interpolating', 'Fill - Polylines Soft', 'Fill - Polylines Sharp'#,
+                     'No fill', 'No fill - Reverse projection', 'Imperfect fill - Hybrid Edge', 'Fill - Naive',
+                    'Fill - Naive interpolating', 'Fill - Polylines Soft', 'Fill - Polylines Sharp', 'GPU Warp (Fast)'#,
                     #'Fill - Post-fill', 'Fill - Reverse projection with Post-fill', 'Fill - Hybrid Edge with fill'
-                ], {"default": "GPU Warp (Fast)"}),
+                ], {"default": "Fill - Polylines Soft"}),
             },
             "optional": {
                 "divergence": ("FLOAT", {"default": 3.5, "min": 0.05, "max": 15, "step": 0.01}),
@@ -567,12 +567,6 @@ class StereoImageNode:
         log_memory(f"Before final concat: {len(results_chunks)} chunks")
         if DEBUG_MEMORY:
             print(f"[DEBUG] Chunk sizes: {[c.shape for c in results_chunks]}")
-
-        # Debug: print shapes to diagnose issues
-        if results_chunks:
-            print(f"[DEBUG] results_chunks[0].shape: {results_chunks[0].shape}")
-            print(f"[DEBUG] depthmap_left_chunks[0].shape: {depthmap_left_chunks[0].shape}")
-            print(f"[DEBUG] mask_chunks[0].shape: {mask_chunks[0].shape}")
 
         # Final memory cleanup
         if torch.cuda.is_available():
