@@ -568,6 +568,12 @@ class StereoImageNode:
         if DEBUG_MEMORY:
             print(f"[DEBUG] Chunk sizes: {[c.shape for c in results_chunks]}")
 
+        # Debug: print shapes to diagnose issues
+        if results_chunks:
+            print(f"[DEBUG] results_chunks[0].shape: {results_chunks[0].shape}")
+            print(f"[DEBUG] depthmap_left_chunks[0].shape: {depthmap_left_chunks[0].shape}")
+            print(f"[DEBUG] mask_chunks[0].shape: {mask_chunks[0].shape}")
+
         # Final memory cleanup
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -649,6 +655,9 @@ class StereoImageNode:
         )
 
     def generate_mask(self, stereoscope_img):
+        # Handle list of images (from CPU path) - take the first one
+        if isinstance(stereoscope_img, list):
+            stereoscope_img = stereoscope_img[0]
         np_img = np.array(stereoscope_img)
         mask = (np_img.sum(axis=-1) == 0).astype(np.uint8) * 255  # Black areas become white in mask
         return np2tensor(mask)
