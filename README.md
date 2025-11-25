@@ -43,12 +43,33 @@ A stereoscopic 3D toolkit for ComfyUI that combines three solutions into one uni
 ```bash
 cd ComfyUI/custom_nodes/
 git clone https://github.com/Dobidop/ComfyStereo.git
+cd ComfyStereo
 ```
 
-2. Install core dependencies:
+2. Install dependencies (choose one):
+
+**Option A: Using requirements.txt (traditional)**
 ```bash
-cd ComfyStereo
+# Base only (stereo generation + DeoVR)
 pip install -r requirements.txt
+
+# Or install all features at once
+pip install -r requirements.txt
+```
+
+**Option B: Using pip with optional dependencies (recommended)**
+```bash
+# Base only
+pip install -e .
+
+# Base + VR viewing
+pip install -e ".[vr]"
+
+# Base + AI stereo generation
+pip install -e ".[ai]"
+
+# Everything (all features)
+pip install -e ".[all]"
 ```
 
 3. Restart ComfyUI
