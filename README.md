@@ -1,6 +1,6 @@
-# ComfyStereo - Complete Stereoscopic 3D Toolkit for ComfyUI
+# ComfyStereo - Stereoscopic 3D Toolkit for ComfyUI
 
-A comprehensive stereoscopic 3D toolkit for ComfyUI that combines three powerful solutions into one unified package:
+A stereoscopic 3D toolkit for ComfyUI that combines three solutions into one unified package:
 
 1. **Stereo Image Generation** - Depth-based stereo conversion with GPU acceleration
 2. **Native VR Viewing** - PyOpenXR viewer for direct VR headset viewing
