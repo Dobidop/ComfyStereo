@@ -1,3 +1,4 @@
+# Core dependencies for basic stereo image generation
 torch
 numpy
 Pillow
@@ -5,3 +6,36 @@ opencv-python
 numba
 scipy
 psutil
+
+# Note: For additional features, install optional dependencies:
+# - Native VR Viewer: pip install -r requirements-native.txt
+# - StereoDiffusion: pip install -r requirements-diffusion.txt
+
+# Native VR Viewer Dependencies (PyOpenXR)
+# Install these for native VR viewing with auto-launch to headset
+# Usage: pip install -r requirements-native.txt
+
+pyopenxr>=1.0.0
+PyOpenGL>=3.1.0
+PyOpenGL_accelerate>=3.1.0
+glfw>=2.0.0
+opencv-python>=4.0.0  # For video playback support
+pygame>=2.0.0  # For audio playback
+
+# Note: ffmpeg must be installed separately for audio extraction from videos
+# Windows: Download from https://ffmpeg.org/download.html
+# Linux: sudo apt install ffmpeg
+# Mac: brew install ffmpeg
+
+# StereoDiffusion Dependencies
+# Install these for AI-powered stereo generation using diffusion models
+# Usage: pip install -r requirements-diffusion.txt
+
+diffusers>=0.21.0
+transformers
+accelerate
+einops
+tqdm
+scikit-image
+
+# Note: torch, numpy, Pillow, and opencv-python are already included in base requirements.txt
