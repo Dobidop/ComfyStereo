@@ -1,0 +1,39 @@
+StereoscopeGenerator - ComfyUI Node for Stereoscopic Image Generation
+======================================================================
+
+This project includes code from the following sources:
+
+1. prompt-to-prompt (https://github.com/google/prompt-to-prompt)
+   Copyright 2022 Google LLC
+   Licensed under the Apache License, Version 2.0
+
+   Files derived from prompt-to-prompt:
+   - diffusion_utils.py: Contains diffusion_step(), init_latent(), and
+     register_attention_control() functions adapted from ptp_utils.py
+   - inversion.py: Contains NullInversion class implementing DDIM inversion
+     with null-text optimization adapted from null_text_w_ptp.ipynb
+
+   Modifications made:
+   - Extracted only the functions needed for this project
+   - Added type hints and docstrings
+   - Removed unused imports and visualization functions
+   - Fixed deprecation warning for unet.in_channels access
+   - Added ComfyUI model compatibility via wrapper classes
+   - Implemented gradient-enabled mode using functional_call for ComfyUI models
+   - Added optional null-text optimization toggle
+
+2. StereoDiffusion (https://github.com/lez-s/StereoDiffusion)
+   License: MIT License
+
+   Files derived from StereoDiffusion:
+   - stereo_utils.py: Contains stereo_shift_torch(), BNAttention class,
+     register_attention_editor_diffusers(), and restore_attention() functions
+
+   Modifications made:
+   - Fixed bug in restore_attention() using sim instead of attn
+   - Fixed numpy/torch dtype compatibility issue in _norm_depth()
+   - Renamed parameter from 'sacle_factor' to 'scale_factor' (typo fix)
+   - Added type hints and docstrings
+   - Removed dependency on stablediffusion submodule (DDIMSampler)
+
+For the full Apache 2.0 license text, see licenses/APACHE-2.0.txt

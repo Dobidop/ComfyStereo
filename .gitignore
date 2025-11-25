@@ -6,3 +6,5 @@ output_*.jpg
 output_*.png
 test_image.jpg
 test_depth.png
+/cloneComfyStereo.bat
+/.claude
