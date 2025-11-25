@@ -15,14 +15,14 @@ A comprehensive stereoscopic 3D toolkit for ComfyUI that combines three powerful
 - **Multiple Output Formats** - Side-by-Side, Top-Bottom, Red-Cyan Anaglyph
 - **Batch Video Processing** - Memory-efficient video frame processing
 
-### Native VR Viewing (Optional)
+### Native VR Viewing
 - **Auto-Launch to Headset** - Direct VR viewing without browser
 - **Multiple Stereo Formats** - Side-by-Side, Over-Under, Mono
 - **Projection Options** - Flat, Curved, 180° Dome, 360° Sphere
 - **Image & Video Support** - View both stereo images and videos
 - **All VR Headsets** - Quest, Vive, Index, WMR, and more
 
-### StereoDiffusion AI (Optional)
+### StereoDiffusion AI
 - **AI-Powered Generation** - Uses diffusion models for stereo creation
 - **DDIM Inversion** - Null-text optimization for high-quality reconstruction
 - **Bilateral Neighbor Attention** - Stereo-consistent diffusion
@@ -91,7 +91,7 @@ Launch and view stereo content in DeoVR.
 **Setup Required:**
 Edit `config.json` to set your DeoVR.exe path. Enable "Remote control" in DeoVR developer settings.
 
-### Native VR Viewer Nodes (Optional)
+### Native VR Viewer Nodes
 
 Requires `pip install -r requirements-native.txt` and a VR runtime (SteamVR, Oculus, or WMR).
 
@@ -133,7 +133,7 @@ Check PyOpenXR installation and VR runtime availability.
 - `status_message` (STRING) - Diagnostic information
 - `is_available` (BOOLEAN) - VR readiness
 
-### StereoDiffusion AI Nodes (Optional)
+### StereoDiffusion AI Nodes
 
 Requires `pip install -r requirements-diffusion.txt` and 8GB+ VRAM.
 
