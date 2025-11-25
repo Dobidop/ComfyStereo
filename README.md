@@ -149,9 +149,6 @@ AI-powered stereo generation using diffusion models.
 - `num_ddim_steps` (INT) - DDIM steps (10-100, default: 50)
 - `null_text_optimization` (BOOLEAN) - Enable for better quality (slower)
 - `guidance_scale` (FLOAT) - CFG scale (1.0-20.0, default: 7.5)
-- `model` (MODEL, optional) - ComfyUI MODEL from checkpoint loader
-- `clip` (CLIP, optional) - ComfyUI CLIP
-- `vae` (VAE, optional) - ComfyUI VAE
 - `model_id` (STRING) - HuggingFace model ID (fallback if MODEL/CLIP/VAE not provided)
 
 **Outputs:**
