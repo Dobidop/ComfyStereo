@@ -636,7 +636,7 @@ class PersistentNativeViewer:
         while not self.media_queue.empty():
             try:
                 self.media_queue.get_nowait()
-            except:
+            except Exception:
                 break
 
         # Mark as not running

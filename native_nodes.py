@@ -3,14 +3,12 @@ Native VR viewer nodes for ComfyUI using PyOpenXR
 Auto-launches directly into VR headset without browser
 """
 
+import hashlib
 import torch
 import numpy as np
 from PIL import Image
-import io
 import os
-import json
 import folder_paths
-import sys
 
 from .native_viewer import (
     check_openxr_available,
@@ -106,7 +104,8 @@ class NativeStereoImageViewer:
             stereo_format = "Side-by-Side"
 
         # Save the stereo image
-        filename = f"{self.prefix_append}_{hash(str(img_np.tobytes()))}.png"
+        img_hash = hashlib.md5(img_np.tobytes()).hexdigest()[:16]
+        filename = f"{self.prefix_append}_{img_hash}.png"
         filepath = os.path.join(self.output_dir, filename)
 
         pil_img = Image.fromarray(img_np)

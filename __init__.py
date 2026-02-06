@@ -23,7 +23,7 @@ except ImportError as e:
     print("\n" + "="*60)
     print("PyOpenXR not available. Native VR viewer nodes disabled.")
     print("To enable native VR viewing:")
-    print("  pip install -r requirements-native.txt")
+    print("  pip install -r requirements.txt")
     print("="*60 + "\n")
 
 # Import StereoDiffusion nodes (optional, requires diffusers)
