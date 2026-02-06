@@ -784,7 +784,9 @@ def enhanced_inverse_mapping_with_mask(original_image, normalized_depth, diverge
     sigma = 1.0  # standard deviation for the subpixel kernel
     for row in prange(h):
         for x in range(w):
-            offset = (normalized_depth[row, x] ** stereo_offset_exponent) * divergence_px
+            d = normalized_depth[row, x]
+            sign_d = 1.0 if d >= 0.0 else -1.0
+            offset = sign_d * (abs(d) ** stereo_offset_exponent) * divergence_px
             dest_x = x + 0.5 + offset + separation_px
             j_center = int(math.floor(dest_x))
             for d in (-1, 0, 1):
@@ -822,7 +824,9 @@ def naive_mapping_with_mask(original_image, normalized_depth, divergence_px: flo
         else:
             rng = range(w - 1, -1, -1)
         for col in rng:
-            offset = (normalized_depth[row, col] ** stereo_offset_exponent) * divergence_px + separation_px
+            d = normalized_depth[row, col]
+            sign_d = 1.0 if d >= 0.0 else -1.0
+            offset = sign_d * (abs(d) ** stereo_offset_exponent) * divergence_px + separation_px
             col_d = col + int(offset)
             if 0 <= col_d < w:
                 derived_image[row, col_d] = original_image[row, col]
@@ -841,7 +845,9 @@ def inverse_mapping_with_mask(original_image, normalized_depth, divergence_px: f
     for row in prange(h):
         depth_buffer = np.full(w, -1.0, dtype=np.float32)
         for x in range(w):
-            offset = (normalized_depth[row, x] ** stereo_offset_exponent) * divergence_px
+            d = normalized_depth[row, x]
+            sign_d = 1.0 if d >= 0.0 else -1.0
+            offset = sign_d * (abs(d) ** stereo_offset_exponent) * divergence_px
             dest_x = x + 0.5 + offset + separation_px
             closeness = normalized_depth[row, x]
             j = int(np.floor(dest_x))
@@ -865,7 +871,9 @@ def apply_stereo_divergence_inverse(original_image, normalized_depth, divergence
     for row in prange(h):
         depth_buffer = np.full(w, -1.0, dtype=np.float32)
         for x in range(w):
-            offset = (normalized_depth[row, x] ** stereo_offset_exponent) * divergence_px
+            d = normalized_depth[row, x]
+            sign_d = 1.0 if d >= 0.0 else -1.0
+            offset = sign_d * (abs(d) ** stereo_offset_exponent) * divergence_px
             dest_x = x + 0.5 + offset + separation_px
             closeness = normalized_depth[row, x]
             j = int(np.floor(dest_x))
@@ -1004,7 +1012,9 @@ def apply_stereo_divergence_naive(
         # Swipe order should ensure that pixels that are closer overwrite
         # (at their destination) pixels that are less close
         for col in range(w) if divergence_px < 0 else range(w - 1, -1, -1):
-            col_d = col + int((normalized_depth[row][col] ** stereo_offset_exponent) * divergence_px + separation_px)
+            d = normalized_depth[row][col]
+            sign_d = 1.0 if d >= 0.0 else -1.0
+            col_d = col + int(sign_d * (abs(d) ** stereo_offset_exponent) * divergence_px + separation_px)
             if 0 <= col_d < w:
                 derived_image[row][col_d] = original_image[row][col]
                 filled[row * w + col_d] = 1
@@ -1063,7 +1073,9 @@ def apply_stereo_divergence_polylines(original_image, normalized_depth, divergen
         pt[pt_end] = [-1.0 * w, 0.0, 0.0]
         pt_end += 1
         for col in range(0, w):
-            coord_d = (normalized_depth[row][col] ** stereo_offset_exponent) * divergence_px
+            d = normalized_depth[row][col]
+            sign_d = 1.0 if d >= 0.0 else -1.0
+            coord_d = sign_d * (abs(d) ** stereo_offset_exponent) * divergence_px
             coord_x = col + 0.5 + coord_d + separation_px
             if PIXEL_HALF_WIDTH < EPSILON:
                 pt[pt_end] = [coord_x, abs(coord_d), col]

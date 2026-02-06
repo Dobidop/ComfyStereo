@@ -58,15 +58,15 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 print("\n" + "="*60)
 print("ComfyStereo - Loaded Modules:")
 print("="*60)
-print(f"✓ Stereo Image Generation ({len(STEREO_NODES)} nodes)")
+print(f"  [OK] Stereo Image Generation ({len(STEREO_NODES)} nodes)")
 if NATIVE_AVAILABLE:
-    print(f"✓ Native VR Viewer ({len(NATIVE_NODES)} nodes)")
+    print(f"  [OK] Native VR Viewer ({len(NATIVE_NODES)} nodes)")
 else:
-    print(f"✗ Native VR Viewer (not available)")
+    print(f"  [--] Native VR Viewer (not available)")
 if DIFFUSION_AVAILABLE:
-    print(f"✓ StereoDiffusion ({len(DIFFUSION_NODES)} nodes)")
+    print(f"  [OK] StereoDiffusion ({len(DIFFUSION_NODES)} nodes)")
 else:
-    print(f"✗ StereoDiffusion (not available)")
+    print(f"  [--] StereoDiffusion (not available)")
 print(f"\nTotal: {len(NODE_CLASS_MAPPINGS)} nodes loaded")
 print("="*60 + "\n")
 
