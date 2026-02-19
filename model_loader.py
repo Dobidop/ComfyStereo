@@ -6,7 +6,7 @@ Functions for loading Stable Diffusion models from HuggingFace or local paths.
 
 import os
 import torch
-from diffusers import StableDiffusionPipeline, DDIMScheduler
+from diffusers import StableDiffusionPipeline, DDIMScheduler, EulerDiscreteScheduler
 
 
 # Global model cache
@@ -19,7 +19,8 @@ def clear_model_cache():
     _model_cache = {}
 
 
-def load_sd_model(model_id_or_path: str = "runwayml/stable-diffusion-v1-5", device: str = "cuda"):
+def load_sd_model(model_id_or_path: str = "runwayml/stable-diffusion-v1-5", device: str = "cuda",
+                  scheduler_type: str = "ddim"):
     """
     Load or retrieve cached Stable Diffusion model.
 
@@ -27,33 +28,47 @@ def load_sd_model(model_id_or_path: str = "runwayml/stable-diffusion-v1-5", devi
         model_id_or_path: Either a HuggingFace model ID (e.g., "runwayml/stable-diffusion-v1-5")
                           or a local path to a diffusers-format model directory.
         device: Device to load the model on ("cuda" or "cpu")
+        scheduler_type: "ddim" for standard DDIM scheduler, "euler" for Euler scheduler
+                        (used with turbo/LCM models)
 
     Returns:
         StableDiffusionPipeline instance
     """
     global _model_cache
 
-    if model_id_or_path in _model_cache:
-        return _model_cache[model_id_or_path]
+    # Include scheduler_type in cache key so different schedulers are cached separately
+    cache_key = f"{model_id_or_path}:{scheduler_type}"
+    if cache_key in _model_cache:
+        return _model_cache[cache_key]
 
-    scheduler = DDIMScheduler(
-        beta_start=0.00085,
-        beta_end=0.012,
-        beta_schedule="scaled_linear",
-        clip_sample=False,
-        set_alpha_to_one=False
-    )
+    if scheduler_type == "euler":
+        scheduler = EulerDiscreteScheduler(
+            beta_start=0.00085,
+            beta_end=0.012,
+            beta_schedule="scaled_linear",
+            timestep_spacing="trailing",
+        )
+    else:
+        scheduler = DDIMScheduler(
+            beta_start=0.00085,
+            beta_end=0.012,
+            beta_schedule="scaled_linear",
+            clip_sample=False,
+            set_alpha_to_one=False
+        )
 
     # Check if it's a local path
     is_local = os.path.isdir(model_id_or_path)
 
-    # Use float32 for null-text optimization (requires gradients)
-    # float16 can cause NaN due to limited precision in gradient computations
+    # Use float32 for standard pipeline (null-text optimization requires gradients)
+    # Use float16 for fast/euler pipeline (turbo models - no gradients, faster inference)
+    model_dtype = torch.float16 if (scheduler_type == "euler" and device != "cpu") else torch.float32
+
     try:
         model = StableDiffusionPipeline.from_pretrained(
             model_id_or_path,
             scheduler=scheduler,
-            torch_dtype=torch.float32,  # Use float32 for gradient stability
+            torch_dtype=model_dtype,
             local_files_only=is_local,
             safety_checker=None,  # Disable safety checker for faster loading
             requires_safety_checker=False,
@@ -64,7 +79,7 @@ def load_sd_model(model_id_or_path: str = "runwayml/stable-diffusion-v1-5", devi
         model = StableDiffusionPipeline.from_pretrained(
             model_id_or_path,
             scheduler=scheduler,
-            torch_dtype=torch.float32,
+            torch_dtype=model_dtype,
             safety_checker=None,
             requires_safety_checker=False,
         ).to(device)
@@ -74,5 +89,5 @@ def load_sd_model(model_id_or_path: str = "runwayml/stable-diffusion-v1-5", devi
     except AttributeError:
         pass
 
-    _model_cache[model_id_or_path] = model
+    _model_cache[cache_key] = model
     return model

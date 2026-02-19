@@ -65,7 +65,7 @@ class StereoImageNode:
                 "stereo_offset_exponent": ("FLOAT", {"default": 2, "min": 1, "max": 2, "step": 1}),
                 "depth_map_blur": ("BOOLEAN", {"default": True}),
                 "depth_blur_edge_threshold": ("FLOAT", {"default": 6, "min": 0.1, "max": 15, "step": 0.1}),
-                "batch_size": ("INT", {"default": 4, "min": 1, "max": 32, "step": 1, "tooltip": "Number of frames to process before clearing GPU memory. Lower values use less memory but may be slower."}),
+                "batch_size": ("INT", {"default": 512, "min": 1, "max": 512, "step": 1, "tooltip": "Number of frames to process before clearing GPU memory. Lower values use less memory but may be slower."}),
             }
         }
     

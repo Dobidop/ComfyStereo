@@ -96,7 +96,8 @@ class BNAttention:
     left and right stereo views during the diffusion process.
     """
 
-    def __init__(self, start_step: int = 4, total_steps: int = 50, direction: str = 'uni'):
+    def __init__(self, start_step: int = 4, total_steps: int = 50, direction: str = 'uni',
+                 use_cfg: bool = True):
         """
         Initialize the BNAttention editor.
 
@@ -104,12 +105,16 @@ class BNAttention:
             start_step: Step at which to start applying stereo attention
             total_steps: Total number of diffusion steps
             direction: 'uni' for unidirectional or 'bi' for bidirectional attention
+            use_cfg: Whether classifier-free guidance is used. Set False for turbo/LCM models.
         """
         self.total_steps = total_steps
         self.start_step = start_step
         self.cur_step = 0
         self.cur_att_layer = 0
         self.direction = direction
+        self.use_cfg = use_cfg
+        # num_att_layers is set by register_attention_editor_diffusers()
+        self.num_att_layers = 0
 
     def attn_batch(
         self, q, k, v, sim, attn, is_cross, place_in_unet, num_heads, **kwargs
@@ -134,6 +139,13 @@ class BNAttention:
             out = rearrange(out, '(b h) n d -> b n (h d)', h=num_heads)
             return out
 
+        if not self.use_cfg:
+            # No-CFG path: batch is just [left_view, right_view] (no uncond/cond split)
+            # attn_batch handles the 2-view stereo pairing via s=2 rearrangement
+            out = self.attn_batch(q, k, v, sim, attn, is_cross, place_in_unet, num_heads, **kwargs)
+            return out
+
+        # CFG path: batch is [uncond_left, uncond_right, cond_left, cond_right]
         n_samples = attn.shape[0] // num_heads // 4
         qu, qc = q.chunk(2)
         ku, kc = k.chunk(2)
@@ -167,7 +179,11 @@ class BNAttention:
         """Call the attention editor."""
         out = self.forward(q, k, v, sim, attn, is_cross, place_in_unet, num_heads, **kwargs)
         self.cur_att_layer += 1
-        self.cur_step = self.cur_att_layer // 32
+        # Use dynamically-counted attention layers (set by register_attention_editor_diffusers)
+        if self.num_att_layers > 0:
+            self.cur_step = self.cur_att_layer // self.num_att_layers
+        else:
+            self.cur_step = self.cur_att_layer // 32  # legacy fallback
         return out
 
 

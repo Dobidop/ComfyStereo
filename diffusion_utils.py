@@ -50,15 +50,49 @@ def diffusion_step(
     Returns:
         Updated latent tensor after the diffusion step
     """
+    # Scale model input if the scheduler requires it (e.g. EulerDiscreteScheduler)
+    scaled_latents = model.scheduler.scale_model_input(latents, t)
     if low_resource:
-        noise_pred_uncond = model.unet(latents, t, encoder_hidden_states=context[0])["sample"]
-        noise_prediction_text = model.unet(latents, t, encoder_hidden_states=context[1])["sample"]
+        noise_pred_uncond = model.unet(scaled_latents, t, encoder_hidden_states=context[0])["sample"]
+        noise_prediction_text = model.unet(scaled_latents, t, encoder_hidden_states=context[1])["sample"]
     else:
-        latents_input = torch.cat([latents] * 2)
+        latents_input = torch.cat([scaled_latents] * 2)
         noise_pred = model.unet(latents_input, t, encoder_hidden_states=context)["sample"]
         noise_pred_uncond, noise_prediction_text = noise_pred.chunk(2)
 
     noise_pred = noise_pred_uncond + guidance_scale * (noise_prediction_text - noise_pred_uncond)
+    latents = model.scheduler.step(noise_pred, t, latents)["prev_sample"]
+    latents = controller.step_callback(latents)
+    return latents
+
+
+def diffusion_step_no_cfg(
+    model,
+    controller,
+    latents: torch.Tensor,
+    context: torch.Tensor,
+    t: int,
+) -> torch.Tensor:
+    """
+    Perform a single diffusion step WITHOUT classifier-free guidance.
+
+    Used for distilled models (SD Turbo, LCM) where CFG is baked into
+    the distillation and guidance_scale should be 0. Runs the UNet once
+    with only the conditional embeddings, halving memory and compute.
+
+    Args:
+        model: A diffusers-compatible model
+        controller: A controller object with step_callback method
+        latents: Current latent tensor [B, C, H, W] where B=2 (left, right)
+        context: Text embeddings [B, seq_len, dim] (cond only, no uncond)
+        t: Current timestep
+
+    Returns:
+        Updated latent tensor after the diffusion step
+    """
+    # Scale model input if the scheduler requires it (e.g. EulerDiscreteScheduler)
+    latent_model_input = model.scheduler.scale_model_input(latents, t)
+    noise_pred = model.unet(latent_model_input, t, encoder_hidden_states=context)["sample"]
     latents = model.scheduler.step(noise_pred, t, latents)["prev_sample"]
     latents = controller.step_callback(latents)
     return latents

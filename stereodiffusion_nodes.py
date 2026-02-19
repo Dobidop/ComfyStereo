@@ -31,6 +31,7 @@ from .stereo_utils import (
 )
 from .diffusion_utils import (
     diffusion_step,
+    diffusion_step_no_cfg,
     init_latent,
 )
 
@@ -95,40 +96,50 @@ class StereoDiffusionNode:
                     "default": False,
                     "tooltip": "Add noise to unfilled regions to avoid blurring"
                 }),
+                "pipeline_mode": (["Standard (DDIM)", "Fast (img2img)"], {
+                    "default": "Standard (DDIM)",
+                    "tooltip": "Standard: DDIM inversion (high quality, slow). Fast: img2img pipeline for turbo/LCM models (fast, good quality)"
+                }),
+                "guidance_scale": ("FLOAT", {
+                    "default": 7.5,
+                    "min": 0.0,
+                    "max": 20.0,
+                    "step": 0.5,
+                    "tooltip": "CFG scale. Standard mode: 3-10. Turbo models: 0.0. LCM: 1.0-2.0"
+                }),
+            },
+            "optional": {
+                # Standard mode parameters
                 "num_ddim_steps": ("INT", {
                     "default": 50,
                     "min": 10,
                     "max": 100,
                     "step": 5,
-                    "tooltip": "Number of DDIM steps for inversion and generation"
+                    "tooltip": "Number of DDIM steps for inversion and generation (Standard mode only)"
                 }),
                 "null_text_optimization": ("BOOLEAN", {
                     "default": True,
-                    "tooltip": "Enable null-text optimization for better reconstruction. Disable for faster processing."
+                    "tooltip": "Enable null-text optimization for better reconstruction (Standard mode only)"
                 }),
-                "guidance_scale": ("FLOAT", {
-                    "default": 7.5,
-                    "min": 1.0,
-                    "max": 20.0,
-                    "step": 0.5,
-                    "tooltip": "CFG scale for inversion and generation. Lower values (3-5) reduce 'burned' look, higher values (10+) increase fidelity but may oversaturate."
+                # Fast mode parameters
+                "denoise_strength": ("FLOAT", {
+                    "default": 0.5,
+                    "min": 0.1,
+                    "max": 1.0,
+                    "step": 0.05,
+                    "tooltip": "How much noise to add before denoising (Fast mode). Lower = preserve original more, Higher = more model creativity for filling gaps"
                 }),
-            },
-            "optional": {
-                # ComfyUI native model inputs (preferred)
-                #"model": ("MODEL", {
-                #    "tooltip": "ComfyUI MODEL from checkpoint loader (preferred over model_id)"
-                #}),
-                #"clip": ("CLIP", {
-                #    "tooltip": "ComfyUI CLIP from checkpoint loader"
-                #}),
-                #"vae": ("VAE", {
-                #    "tooltip": "ComfyUI VAE from checkpoint loader"
-                #}),
-                # Legacy diffusers model path
+                "num_steps": ("INT", {
+                    "default": 5,
+                    "min": 1,
+                    "max": 20,
+                    "step": 1,
+                    "tooltip": "Number of denoising steps (Fast mode). Turbo: 1-4, LCM: 4-8"
+                }),
+                # Model inputs
                 "model_id": ("STRING", {
                     "default": "runwayml/stable-diffusion-v1-5",
-                    "tooltip": "HuggingFace model ID (e.g., 'runwayml/stable-diffusion-v1-5') or local path (only used if MODEL/CLIP/VAE not connected)"
+                    "tooltip": "HuggingFace model ID or local path. Standard: 'runwayml/stable-diffusion-v1-5', Turbo: 'stabilityai/sd-turbo'"
                 }),
             }
         }
@@ -145,9 +156,12 @@ class StereoDiffusionNode:
         scale_factor: float,
         direction: str,
         deblur: bool,
-        num_ddim_steps: int,
-        null_text_optimization: bool = True,
+        pipeline_mode: str = "Standard (DDIM)",
         guidance_scale: float = 7.5,
+        num_ddim_steps: int = 50,
+        null_text_optimization: bool = True,
+        denoise_strength: float = 0.5,
+        num_steps: int = 5,
         model=None,
         clip=None,
         vae=None,
@@ -155,10 +169,17 @@ class StereoDiffusionNode:
     ):
         # Exit inference mode for the entire function - needed for null-text optimization
         with torch.inference_mode(False):
-            return self._generate_stereo_impl(
-                image, depth_map, scale_factor, direction, deblur, num_ddim_steps,
-                null_text_optimization, guidance_scale, model, clip, vae, model_id
-            )
+            if pipeline_mode == "Fast (img2img)":
+                return self._generate_stereo_fast(
+                    image, depth_map, scale_factor, direction, deblur,
+                    denoise_strength, num_steps, guidance_scale,
+                    model, clip, vae, model_id
+                )
+            else:
+                return self._generate_stereo_impl(
+                    image, depth_map, scale_factor, direction, deblur, num_ddim_steps,
+                    null_text_optimization, guidance_scale, model, clip, vae, model_id
+                )
 
     def _generate_stereo_impl(
         self,
@@ -256,6 +277,175 @@ class StereoDiffusionNode:
         return (stereo_tensor, left_tensor, right_tensor)
 
     @torch.no_grad()
+    def _generate_stereo_fast(
+        self,
+        image: torch.Tensor,
+        depth_map: torch.Tensor,
+        scale_factor: float,
+        direction: str,
+        deblur: bool,
+        denoise_strength: float,
+        num_steps: int,
+        guidance_scale: float,
+        model,
+        clip,
+        vae,
+        model_id: str
+    ):
+        """Fast stereo pipeline using img2img approach. No DDIM inversion needed.
+
+        Works with turbo/LCM/lightning models by:
+        1. VAE-encoding the input image to a clean latent
+        2. Applying stereo shift on the clean latent
+        3. Adding noise (controlled by denoise_strength)
+        4. Denoising for a few steps with BNAttention for cross-view consistency
+        """
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        use_cfg = guidance_scale > 1.0
+
+        # 1. Load model
+        use_comfyui_model = model is not None and clip is not None and vae is not None
+
+        if use_comfyui_model:
+            ldm_stable = ComfyUIModelWrapper(model, clip, vae, device=str(device))
+            ldm_stable.set_scheduler_for_mode("fast")
+            print(f"Fast pipeline - Detected model type: {ldm_stable.model_type}")
+        else:
+            if not model_id:
+                model_id = "stabilityai/sd-turbo"
+            print(f"Fast pipeline - Using diffusers model: {model_id}")
+            ldm_stable = load_sd_model(model_id, str(device), scheduler_type="euler")
+
+        # 2. Prepare inputs
+        img_np = tensor_to_numpy(image)
+        depth_np = tensor_to_numpy(depth_map)
+
+        if len(depth_np.shape) == 3 and depth_np.shape[2] == 3:
+            depth_np = np.dot(depth_np[..., :3], [0.2989, 0.5870, 0.1140]).astype(np.uint8)
+
+        original_size = (img_np.shape[1], img_np.shape[0])
+        img_resized = np.array(Image.fromarray(img_np).resize((512, 512)))
+        depth_resized = np.array(Image.fromarray(depth_np).resize((512, 512)))
+
+        # 3. VAE encode to get clean latent z_0
+        model_dtype = next(ldm_stable.vae.parameters()).dtype
+        img_tensor = torch.from_numpy(img_resized).float() / 127.5 - 1.0
+        img_tensor = img_tensor.permute(2, 0, 1).unsqueeze(0).to(device).to(model_dtype)
+        z_0 = ldm_stable.vae.encode(img_tensor)['latent_dist'].mean
+        z_0 = z_0 * 0.18215
+
+        # 4. Prepare disparity in latent space
+        depth_tensor = torch.tensor(depth_resized, device=device, dtype=torch.float32) / 255.0
+        disp = _norm_depth(depth_tensor.unsqueeze(0))
+        disp_latent = torch.nn.functional.interpolate(
+            disp.unsqueeze(1), size=[64, 64], mode="bicubic", align_corners=False
+        ).squeeze(1)
+
+        # 5. Apply stereo shift to clean latent
+        # stereo_shift_torch returns [2, C, 64, 64] -> [left (original), right (shifted)]
+        z_0_stereo = stereo_shift_torch(z_0, disp_latent, scale_factor=scale_factor)
+        mask = z_0_stereo[1:, 0, ...] != 0
+        mask = rearrange(mask, 'b h w -> b () h w').repeat(1, 4, 1, 1)
+
+        if deblur:
+            noise_fill = torch.randn_like(z_0_stereo[1:])
+            z_0_stereo[1:][~mask] = noise_fill[~mask]
+
+        # 6. Add noise based on denoise_strength
+        ldm_stable.scheduler.set_timesteps(num_steps, device=device)
+        timesteps = ldm_stable.scheduler.timesteps
+
+        # Determine start timestep from denoise_strength
+        # With denoise_strength=1.0, start from the first (noisiest) timestep
+        # With denoise_strength=0.5, skip the first half of timesteps
+        start_step_idx = max(0, int(len(timesteps) * (1.0 - denoise_strength)))
+        t_start = timesteps[start_step_idx]
+        active_timesteps = timesteps[start_step_idx:]
+
+        print(f"Fast pipeline - {len(active_timesteps)} active denoising steps "
+              f"(from {num_steps} total, denoise_strength={denoise_strength})")
+
+        noise = torch.randn_like(z_0_stereo)
+        # Ensure z_0_stereo is on the right device/dtype before adding noise
+        z_0_stereo = z_0_stereo.to(device)
+        # add_noise expects timesteps as a 1D tensor, not a scalar
+        t_start_tensor = t_start.unsqueeze(0) if t_start.dim() == 0 else t_start
+        latents = ldm_stable.scheduler.add_noise(z_0_stereo, noise, t_start_tensor)
+
+        # 7. Register BNAttention for cross-view consistency
+        editor = BNAttention(
+            start_step=0,
+            total_steps=len(active_timesteps),
+            direction=direction,
+            use_cfg=use_cfg
+        )
+        register_attention_editor_diffusers(ldm_stable, editor)
+
+        # 8. Get text embeddings
+        prompt = ""
+        batch_size = 2  # left + right views
+        text_input = ldm_stable.tokenizer(
+            [prompt] * batch_size,
+            padding="max_length",
+            max_length=ldm_stable.tokenizer.model_max_length,
+            truncation=True,
+            return_tensors="pt",
+        )
+        text_embeddings = ldm_stable.text_encoder(text_input.input_ids.to(ldm_stable.device))[0]
+
+        # 9. Denoising loop
+        controller = EmptyControl()
+        reshift_interval = max(1, len(active_timesteps) // 5)
+
+        for i, t in enumerate(tqdm(active_timesteps, desc="Fast stereo generation")):
+            if use_cfg:
+                # With CFG: build uncond + cond context
+                uncond_input = ldm_stable.tokenizer(
+                    [""] * batch_size, padding="max_length",
+                    max_length=ldm_stable.tokenizer.model_max_length, return_tensors="pt"
+                )
+                uncond_emb = ldm_stable.text_encoder(uncond_input.input_ids.to(ldm_stable.device))[0]
+                context = torch.cat([uncond_emb, text_embeddings])
+                latents = diffusion_step(
+                    ldm_stable, controller, latents, context, t,
+                    guidance_scale, low_resource=False
+                )
+            else:
+                # No CFG: single UNet pass with cond embeddings only
+                latents = diffusion_step_no_cfg(
+                    ldm_stable, controller, latents, text_embeddings, t
+                )
+
+            # Periodic re-application of stereo shift to maintain stereo effect
+            if i > 0 and i % reshift_interval == 0 and mask is not None:
+                z_reshift = stereo_shift_torch(
+                    latents[:1], disp_latent, scale_factor=scale_factor
+                )
+                latents[1:][mask] = z_reshift[1:][mask]
+
+        # 10. VAE decode
+        latents_scaled = 1 / 0.18215 * latents
+        decoded = ldm_stable.vae.decode(latents_scaled)['sample']
+        decoded = (decoded / 2 + 0.5).clamp(0, 1)
+        decoded = decoded.cpu().permute(0, 2, 3, 1).float().numpy()
+        decoded = np.nan_to_num(decoded, nan=0.0, posinf=1.0, neginf=0.0)
+        decoded = (decoded * 255).astype(np.uint8)
+
+        # Restore original attention mechanism
+        restore_attention(ldm_stable)
+
+        # 11. Extract and resize
+        left_img = np.array(Image.fromarray(decoded[0]).resize(original_size))
+        right_img = np.array(Image.fromarray(decoded[1]).resize(original_size))
+        stereo_pair = np.hstack([left_img, right_img])
+
+        stereo_tensor = numpy_to_tensor(stereo_pair)
+        left_tensor = numpy_to_tensor(left_img)
+        right_tensor = numpy_to_tensor(right_img)
+
+        return (stereo_tensor, left_tensor, right_tensor)
+
+    @torch.no_grad()
     def _text2stereoimage(
         self,
         model,
@@ -273,8 +463,9 @@ class StereoDiffusionNode:
         """Generate stereo image pair using diffusion with latent shifting."""
 
         controller = EmptyControl()
-        sa = 10  # Start attention manipulation at step 10
-        editor = BNAttention(start_step=sa, direction=direction)
+        # Start attention manipulation at ~20% of total steps (proportional timing)
+        sa = max(1, int(num_inference_steps * 0.2))
+        editor = BNAttention(start_step=sa, total_steps=num_inference_steps, direction=direction)
         register_attention_editor_diffusers(model, editor)
 
         batch_size = len(prompt)
@@ -304,6 +495,10 @@ class StereoDiffusionNode:
 
         mask = None
 
+        # Proportional timing: apply stereo shift at ~20% of total steps
+        shift_step = max(1, int(num_inference_steps * 0.2))
+        reshift_interval = max(1, int(num_inference_steps * 0.2))
+
         for i, t in enumerate(tqdm(model.scheduler.timesteps[-num_inference_steps:], desc="Generating stereo")):
             # Build context with uncond embeddings
             if uncond_embeddings is not None:
@@ -322,8 +517,8 @@ class StereoDiffusionNode:
                 guidance_scale, low_resource=False
             )
 
-            # Apply stereo shift at step 10
-            if i == 10:
+            # Apply stereo shift at the proportional shift step
+            if i == shift_step:
                 latents_ts = stereo_shift_torch(
                     latents[:1], disp_latent, scale_factor=scale_factor
                 )[1:]
@@ -337,7 +532,7 @@ class StereoDiffusionNode:
                     latents[1:][mask] = latents_ts[mask]
 
             # Periodic re-application of stereo shift
-            if i > 10 and i % 10 == 0 and mask is not None:
+            if i > shift_step and i % reshift_interval == 0 and mask is not None:
                 latents_ts = stereo_shift_torch(
                     latents[:1], disp_latent, scale_factor=scale_factor
                 )[1:]
@@ -365,5 +560,5 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "StereoDiffusion": "StereoDiffusion (stable-diffusion-v1-5)",
+    "StereoDiffusion": "StereoDiffusion",
 }

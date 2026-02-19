@@ -17,6 +17,20 @@ import torch.nn.functional as F
 CUDA_AVAILABLE = torch.cuda.is_available()
 
 
+def _get_device(*tensors):
+    """Get the best available device, with CUDA fallback to CPU on error."""
+    for t in tensors:
+        if t.is_cuda:
+            return t.device
+    if CUDA_AVAILABLE:
+        try:
+            torch.zeros(1, device='cuda')
+            return torch.device('cuda')
+        except RuntimeError:
+            return torch.device('cpu')
+    return torch.device('cpu')
+
+
 def apply_stereo_divergence_gpu(image_tensor, depth_tensor, divergence_px, separation_px,
                                  stereo_offset_exponent, convergence_point=0.5):
     """
@@ -36,9 +50,7 @@ def apply_stereo_divergence_gpu(image_tensor, depth_tensor, divergence_px, separ
     Returns:
         torch.Tensor: Warped image [C, H, W], values 0-1
     """
-    device = depth_tensor.device if depth_tensor.is_cuda else ('cuda' if CUDA_AVAILABLE else 'cpu')
-
-    # Ensure image is on the right device and in [C, H, W] format
+    device = _get_device(depth_tensor, image_tensor)
     image_tensor = image_tensor.to(device)
     depth_tensor = depth_tensor.to(device)
 
@@ -127,8 +139,7 @@ def apply_stereo_divergence_gpu_with_fill(image_tensor, depth_tensor, divergence
     Returns:
         tuple: (warped_image [C,H,W], mask [H,W] indicating valid pixels)
     """
-    device = depth_tensor.device if depth_tensor.is_cuda else ('cuda' if CUDA_AVAILABLE else 'cpu')
-
+    device = _get_device(depth_tensor, image_tensor)
     image_tensor = image_tensor.to(device)
     depth_tensor = depth_tensor.to(device)
 
@@ -232,8 +243,7 @@ def create_stereoimages_gpu(image_tensor, depth_tensor, divergence, separation=0
     if len(modes) == 0:
         return [], None, None
 
-    device = depth_tensor.device if depth_tensor.is_cuda else ('cuda' if CUDA_AVAILABLE else 'cpu')
-
+    device = _get_device(depth_tensor, image_tensor)
     image_tensor = image_tensor.to(device)
     depth_tensor = depth_tensor.to(device)
 
@@ -351,8 +361,7 @@ def directional_motion_blur_gpu(depth_tensor, blur_strength, edge_threshold, blu
     if blur_strength <= 0:
         return depth_tensor, depth_tensor
 
-    # Ensure tensor is on GPU if available
-    device = depth_tensor.device if depth_tensor.is_cuda else ('cuda' if CUDA_AVAILABLE else 'cpu')
+    device = _get_device(depth_tensor)
     depth_tensor = depth_tensor.to(device)
 
     # Ensure 4D tensor [B, C, H, W]

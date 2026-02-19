@@ -7,7 +7,7 @@ and ComfyUI native models.
 """
 
 import torch
-from diffusers import DDIMScheduler
+from diffusers import DDIMScheduler, EulerDiscreteScheduler
 
 # Import functional_call for gradient-enabled forward passes
 # Available in PyTorch 2.0+ as torch.func, fallback to functorch for older versions
@@ -22,6 +22,9 @@ except ImportError:
 
 # Supported model types for stereo generation
 SUPPORTED_MODEL_TYPES = ["SD1", "SD2"]
+
+# Model types that support the fast (img2img) pipeline without DDIM inversion
+FAST_PIPELINE_MODEL_TYPES = ["SD1", "SD2", "SD_TURBO"]
 
 
 class VAEWrapper:
@@ -378,17 +381,11 @@ class ComfyUIModelWrapper:
         self.text_encoder = TextEncoderWrapper(clip, device)
         self.tokenizer = TokenizerWrapper(clip)
 
-        # Create a DDIM scheduler compatible with our code
-        self.scheduler = DDIMScheduler(
-            beta_start=0.00085,
-            beta_end=0.012,
-            beta_schedule="scaled_linear",
-            clip_sample=False,
-            set_alpha_to_one=False
-        )
-
         # Store model config for compatibility checks
         self._model_type = self._detect_model_type()
+
+        # Create appropriate scheduler based on detected model type
+        self.scheduler = self._create_scheduler()
 
     def _detect_model_type(self) -> str:
         """Detect the model architecture type."""
@@ -415,6 +412,48 @@ class ComfyUIModelWrapper:
         except Exception:
             return "UNKNOWN"
 
+    def _create_scheduler(self):
+        """Create appropriate scheduler based on detected model type."""
+        if self._model_type == "SD_TURBO":
+            return EulerDiscreteScheduler(
+                beta_start=0.00085,
+                beta_end=0.012,
+                beta_schedule="scaled_linear",
+                timestep_spacing="trailing",
+            )
+        else:
+            return DDIMScheduler(
+                beta_start=0.00085,
+                beta_end=0.012,
+                beta_schedule="scaled_linear",
+                clip_sample=False,
+                set_alpha_to_one=False,
+            )
+
+    def set_scheduler_for_mode(self, mode: str):
+        """
+        Override scheduler based on pipeline mode.
+
+        Args:
+            mode: "fast" for EulerDiscreteScheduler (turbo/LCM compatible),
+                  "standard" to keep the auto-detected scheduler
+        """
+        if mode == "fast":
+            self.scheduler = EulerDiscreteScheduler(
+                beta_start=0.00085,
+                beta_end=0.012,
+                beta_schedule="scaled_linear",
+                timestep_spacing="trailing",
+            )
+        elif mode == "standard":
+            self.scheduler = DDIMScheduler(
+                beta_start=0.00085,
+                beta_end=0.012,
+                beta_schedule="scaled_linear",
+                clip_sample=False,
+                set_alpha_to_one=False,
+            )
+
     @property
     def device(self):
         """Return the actual device where the model is loaded."""
@@ -427,8 +466,10 @@ class ComfyUIModelWrapper:
     def model_type(self) -> str:
         return self._model_type
 
-    def is_supported(self) -> bool:
-        """Check if this model type is supported for stereo generation."""
+    def is_supported(self, pipeline_mode: str = "standard") -> bool:
+        """Check if this model type is supported for the given pipeline mode."""
+        if pipeline_mode == "fast":
+            return self._model_type in FAST_PIPELINE_MODEL_TYPES
         return self._model_type in SUPPORTED_MODEL_TYPES
 
     def get_unsupported_message(self) -> str:
