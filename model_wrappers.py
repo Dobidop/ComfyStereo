@@ -7,7 +7,11 @@ and ComfyUI native models.
 """
 
 import torch
-from diffusers import DDIMScheduler, EulerDiscreteScheduler
+import torch.nn.functional as F
+import numpy as np
+from PIL import Image
+from diffusers import DDIMScheduler, EulerDiscreteScheduler, PNDMScheduler
+from tqdm import tqdm
 
 # Import functional_call for gradient-enabled forward passes
 # Available in PyTorch 2.0+ as torch.func, fallback to functorch for older versions
@@ -479,3 +483,159 @@ class ComfyUIModelWrapper:
             f"Currently supported: {', '.join(SUPPORTED_MODEL_TYPES)}. "
             f"SDXL and FLUX support may be added in future updates."
         )
+
+
+class ComfyUIInpaintRunner:
+    """
+    Runs SD inpainting using ComfyUI model components (9-channel UNet).
+
+    Provides a __call__ interface matching diffusers StableDiffusionInpaintPipeline
+    so it can be used as a drop-in replacement in _generate_stereo_fast.
+    """
+
+    def __init__(self, comfy_model, comfy_clip, comfy_vae, device="cuda"):
+        import comfy.model_management
+        comfy.model_management.load_models_gpu([comfy_model])
+
+        self.device = torch.device(device)
+        self.unet = comfy_model.model.diffusion_model
+        self.vae = VAEWrapper(comfy_vae, device)
+        self.text_encoder = TextEncoderWrapper(comfy_clip, device)
+        self.tokenizer = TokenizerWrapper(comfy_clip)
+
+        # Verify 9-channel UNet
+        in_ch = self.unet.in_channels if hasattr(self.unet, 'in_channels') else 4
+        if in_ch != 9:
+            raise ValueError(
+                f"Connected model has {in_ch} UNet input channels, but inpainting "
+                f"requires 9 channels. Please use an inpainting checkpoint "
+                f"(e.g., sd-v1-5-inpainting)."
+            )
+
+        self.scheduler = PNDMScheduler(
+            beta_start=0.00085,
+            beta_end=0.012,
+            beta_schedule="scaled_linear",
+            skip_prk_steps=True,
+        )
+
+    def __call__(self, prompt, image, mask_image, num_inference_steps=30,
+                 guidance_scale=7.5, strength=1.0, generator=None):
+        """
+        Run inpainting. Matches diffusers StableDiffusionInpaintPipeline interface.
+
+        Args:
+            prompt: Text prompt string
+            image: PIL Image (RGB, 512x512)
+            mask_image: PIL Image (L mode, 512x512) - white=inpaint, black=keep
+            num_inference_steps: Number of denoising steps
+            guidance_scale: CFG scale
+            strength: Controls how much of the masked area is regenerated
+            generator: torch.Generator for reproducibility
+
+        Returns:
+            Object with .images[0] as PIL Image
+        """
+        model_device = next(self.unet.parameters()).device
+        model_dtype = next(self.unet.parameters()).dtype
+
+        # 1. Encode text prompt (with CFG: unconditional + conditional)
+        text_input = self.tokenizer(
+            [prompt], padding="max_length",
+            max_length=self.tokenizer.model_max_length,
+            truncation=True, return_tensors="pt"
+        )
+        text_embeddings = self.text_encoder(text_input.input_ids.to(model_device))[0]
+
+        uncond_input = self.tokenizer(
+            [""], padding="max_length",
+            max_length=self.tokenizer.model_max_length,
+            truncation=True, return_tensors="pt"
+        )
+        uncond_embeddings = self.text_encoder(uncond_input.input_ids.to(model_device))[0]
+
+        # Concat for CFG: [uncond, cond]
+        text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
+
+        # 2. Prepare image and mask tensors
+        # Image: PIL -> [1, C, H, W] in [-1, 1]
+        img_np = np.array(image).astype(np.float32) / 255.0
+        img_t = torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0)  # [1,3,H,W] in [0,1]
+        img_t = (img_t * 2.0 - 1.0).to(device=model_device, dtype=model_dtype)
+
+        # Mask: PIL -> [1, 1, H, W] in [0, 1] (1=inpaint)
+        mask_np = np.array(mask_image).astype(np.float32) / 255.0
+        mask_t = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
+        mask_t = mask_t.to(device=model_device, dtype=model_dtype)
+
+        # Masked image: zero out the masked region
+        masked_img_t = img_t * (1 - mask_t)  # keep only unmasked pixels
+
+        # 3. VAE encode image and masked image
+        img_latent = self.vae.encode(img_t)['latent_dist'].mean * 0.18215
+        masked_img_latent = self.vae.encode(masked_img_t)['latent_dist'].mean * 0.18215
+
+        # Downsample mask to latent space
+        h_latent, w_latent = img_latent.shape[2], img_latent.shape[3]
+        mask_latent = F.interpolate(mask_t, size=(h_latent, w_latent), mode='nearest')
+
+        # Ensure all on model device
+        img_latent = img_latent.to(device=model_device, dtype=model_dtype)
+        masked_img_latent = masked_img_latent.to(device=model_device, dtype=model_dtype)
+        mask_latent = mask_latent.to(device=model_device, dtype=model_dtype)
+
+        # 4. Set up scheduler and noise
+        self.scheduler.set_timesteps(num_inference_steps, device=model_device)
+        timesteps = self.scheduler.timesteps
+
+        # Apply strength: skip early steps
+        start_step = max(0, int(len(timesteps) * (1.0 - strength)))
+        timesteps = timesteps[start_step:]
+
+        # Add noise to image latent
+        noise = torch.randn(img_latent.shape, generator=generator,
+                            device="cpu", dtype=model_dtype).to(model_device)
+        if len(timesteps) > 0:
+            t_start = timesteps[0:1]
+            latents = self.scheduler.add_noise(img_latent, noise, t_start)
+        else:
+            latents = img_latent
+
+        # 5. Denoising loop
+        for t in tqdm(timesteps, desc="Inpainting"):
+            # Concat: [latent(4ch), mask(1ch), masked_image_latent(4ch)] = 9ch
+            latent_model_input = torch.cat([latents, mask_latent, masked_img_latent], dim=1)
+
+            # CFG: duplicate for unconditional + conditional
+            latent_model_input = torch.cat([latent_model_input] * 2)
+            t_batch = t.expand(2)
+
+            # UNet forward
+            noise_pred = self.unet(
+                latent_model_input.to(model_dtype),
+                t_batch.to(device=model_device, dtype=model_dtype),
+                context=text_embeddings.to(model_dtype)
+            )
+
+            # CFG guidance
+            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+            noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+            # Scheduler step
+            latents = self.scheduler.step(noise_pred, t, latents).prev_sample
+
+        # 6. VAE decode
+        decoded = self.vae.decode(latents / 0.18215)['sample']
+        decoded = (decoded / 2 + 0.5).clamp(0, 1)
+
+        # Convert to PIL
+        result_np = decoded[0].permute(1, 2, 0).cpu().float().numpy()
+        result_np = np.nan_to_num(result_np, nan=0.0, posinf=1.0, neginf=0.0)
+        result_pil = Image.fromarray((result_np * 255).astype(np.uint8))
+
+        # Return object matching diffusers interface
+        class InpaintResult:
+            def __init__(self, imgs):
+                self.images = imgs
+
+        return InpaintResult([result_pil])

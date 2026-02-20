@@ -82,7 +82,7 @@ class StereoDiffusionNode:
                 "image": ("IMAGE",),
                 "depth_map": ("IMAGE",),
                 "scale_factor": ("FLOAT", {
-                    "default": 9.0,
+                    "default": 5.0,
                     "min": 1.0,
                     "max": 20.0,
                     "step": 0.5,
@@ -97,53 +97,61 @@ class StereoDiffusionNode:
                     "tooltip": "Add noise to unfilled regions to avoid blurring"
                 }),
                 "pipeline_mode": (["Standard (DDIM)", "Fast (Warp + Inpaint)"], {
-                    "default": "Standard (DDIM)",
+                    "default": "Fast (Warp + Inpaint)",
                     "tooltip": "Standard: DDIM inversion (high quality, slow). Fast: Warp image with depth, then AI-inpaint only the gap regions (fast, works with turbo/LCM models)"
                 }),
                 "guidance_scale": ("FLOAT", {
-                    "default": 7.5,
+                    "default": 3.0,
                     "min": 0.0,
                     "max": 20.0,
                     "step": 0.5,
                     "tooltip": "CFG scale. Standard mode: 3-10. Turbo models: 0.0. LCM: 1.0-2.0"
                 }),
+                "num_inference_steps": ("INT", {
+                    "default": 20,
+                    "min": 1,
+                    "max": 100,
+                    "step": 1,
+                    "tooltip": "Number of inference steps. Standard DDIM: 30-100 (default 50). Fast inpainting: 20-30. Turbo/LCM: 1-8"
+                }),
+                "seed": ("INT", {
+                    "default": 1337,
+                    "min": 0,
+                    "max": 0xffffffffffffffff,
+                    "control_after_generate": True,
+                    "tooltip": "Random seed for reproducible results"
+                }),
             },
             "optional": {
-                # Standard mode parameters
-                "num_ddim_steps": ("INT", {
-                    "default": 50,
-                    "min": 10,
-                    "max": 100,
-                    "step": 5,
-                    "tooltip": "Number of DDIM steps for inversion and generation (Standard mode only)"
-                }),
                 "null_text_optimization": ("BOOLEAN", {
                     "default": True,
                     "tooltip": "Enable null-text optimization for better reconstruction (Standard mode only)"
                 }),
-                # Fast mode parameters
                 "denoise_strength": ("FLOAT", {
-                    "default": 0.5,
+                    "default": 0.6,
                     "min": 0.1,
                     "max": 1.0,
                     "step": 0.05,
                     "tooltip": "How much noise to add before denoising (Fast mode). Lower = preserve original more, Higher = more model creativity for filling gaps"
                 }),
-                "num_steps": ("INT", {
-                    "default": 5,
-                    "min": 1,
-                    "max": 20,
-                    "step": 1,
-                    "tooltip": "Number of denoising steps (Fast mode). Turbo: 1-4, LCM: 4-8"
+                # Model inputs - connect ComfyUI inpainting model (9ch UNet) for Fast mode,
+                # or standard model for Standard mode
+                "model": ("MODEL", {
+                    "tooltip": "ComfyUI MODEL input. Fast mode: use inpainting model (9ch UNet). Standard mode: use any SD1/SD2 model."
                 }),
-                # Model inputs
+                "clip": ("CLIP", {
+                    "tooltip": "CLIP from Load Checkpoint"
+                }),
+                "vae": ("VAE", {
+                    "tooltip": "VAE from Load Checkpoint"
+                }),
                 "model_id": ("STRING", {
                     "default": "runwayml/stable-diffusion-v1-5",
-                    "tooltip": "HuggingFace model ID or local path. Standard: 'runwayml/stable-diffusion-v1-5', Turbo: 'stabilityai/sd-turbo'"
+                    "tooltip": "Fallback HuggingFace model ID (Standard mode, when no ComfyUI model connected)"
                 }),
                 "inpaint_model_id": ("STRING", {
                     "default": "runwayml/stable-diffusion-inpainting",
-                    "tooltip": "HuggingFace inpainting model ID (Fast mode). Default: 'runwayml/stable-diffusion-inpainting'"
+                    "tooltip": "Fallback inpainting model ID (Fast mode, when no ComfyUI model connected)"
                 }),
                 "prompt": ("STRING", {
                     "default": "",
@@ -167,10 +175,10 @@ class StereoDiffusionNode:
         deblur: bool,
         pipeline_mode: str = "Standard (DDIM)",
         guidance_scale: float = 7.5,
-        num_ddim_steps: int = 50,
+        num_inference_steps: int = 50,
+        seed: int = 0,
         null_text_optimization: bool = True,
         denoise_strength: float = 0.5,
-        num_steps: int = 5,
         model=None,
         clip=None,
         vae=None,
@@ -178,18 +186,23 @@ class StereoDiffusionNode:
         inpaint_model_id: str = "runwayml/stable-diffusion-inpainting",
         prompt: str = ""
     ):
+        # Create reproducible generator from seed
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(seed)
+
         # Exit inference mode for the entire function - needed for null-text optimization
         with torch.inference_mode(False):
             if pipeline_mode == "Fast (Warp + Inpaint)":
                 return self._generate_stereo_fast(
                     image, depth_map, scale_factor, direction, deblur,
-                    denoise_strength, num_steps, guidance_scale,
-                    model, clip, vae, inpaint_model_id, prompt
+                    denoise_strength, num_inference_steps, guidance_scale,
+                    model, clip, vae, inpaint_model_id, prompt, seed, generator
                 )
             else:
                 return self._generate_stereo_impl(
-                    image, depth_map, scale_factor, direction, deblur, num_ddim_steps,
-                    null_text_optimization, guidance_scale, model, clip, vae, model_id
+                    image, depth_map, scale_factor, direction, deblur, num_inference_steps,
+                    null_text_optimization, guidance_scale, model, clip, vae, model_id,
+                    generator
                 )
 
     def _generate_stereo_impl(
@@ -199,15 +212,20 @@ class StereoDiffusionNode:
         scale_factor: float,
         direction: str,
         deblur: bool,
-        num_ddim_steps: int,
+        num_inference_steps: int,
         null_text_optimization: bool,
         guidance_scale: float,
         model,
         clip,
         vae,
-        model_id: str
+        model_id: str,
+        generator: torch.Generator = None
     ):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        if image.shape[0] > 1:
+            print("Warning: Standard (DDIM) mode processes only the first frame. "
+                  "Use Fast (Warp + Inpaint) mode for batch/video processing.")
 
         # Determine which model source to use
         use_comfyui_model = model is not None and clip is not None and vae is not None
@@ -247,7 +265,7 @@ class StereoDiffusionNode:
         disp = _norm_depth(depth_tensor.unsqueeze(0))
 
         # Run null-text inversion
-        null_inversion = NullInversion(ldm_stable, num_ddim_steps, guidance_scale=guidance_scale)
+        null_inversion = NullInversion(ldm_stable, num_inference_steps, guidance_scale=guidance_scale)
         prompt = ""
         (image_gt, image_rec), x_t, uncond_embeddings = null_inversion.invert(
             img_resized, prompt, num_inner_steps=10, early_stop_epsilon=1e-5,
@@ -264,9 +282,10 @@ class StereoDiffusionNode:
             scale_factor,
             direction,
             deblur,
-            num_ddim_steps,
+            num_inference_steps,
             guidance_scale,
-            device
+            device,
+            generator
         )
 
         # Extract left and right images
@@ -296,13 +315,15 @@ class StereoDiffusionNode:
         direction: str,
         deblur: bool,
         denoise_strength: float,
-        num_steps: int,
+        num_inference_steps: int,
         guidance_scale: float,
         model,
         clip,
         vae,
         inpaint_model_id: str,
-        prompt: str
+        prompt: str,
+        seed: int = 0,
+        generator: torch.Generator = None
     ):
         """Warp + Inpaint pipeline for fast stereo generation.
 
@@ -314,19 +335,85 @@ class StereoDiffusionNode:
         This preserves the original image perfectly in non-gap areas and only
         uses AI to fill the small disoccluded strips.
         """
-        import torch.nn.functional as F
-
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         # 1. Load inpainting model
-        if not inpaint_model_id:
-            inpaint_model_id = "runwayml/stable-diffusion-inpainting"
-        print(f"Warp+Inpaint pipeline - Using inpainting model: {inpaint_model_id}")
-        inpaint_pipe = load_inpainting_model(inpaint_model_id, str(device))
+        use_comfyui_model = model is not None and clip is not None and vae is not None
 
-        # 2. Prepare inputs
-        img_np = tensor_to_numpy(image)
-        depth_np = tensor_to_numpy(depth_map)
+        if use_comfyui_model:
+            # Check if the ComfyUI model is an inpainting model (9ch UNet)
+            from .model_wrappers import ComfyUIInpaintRunner
+            unet_module = model.model.diffusion_model
+            in_ch = unet_module.in_channels if hasattr(unet_module, 'in_channels') else 4
+            if in_ch == 9:
+                print(f"Warp+Inpaint pipeline - Using ComfyUI inpainting model ({in_ch}ch UNet)")
+                inpaint_pipe = ComfyUIInpaintRunner(model, clip, vae, device=str(device))
+            else:
+                print(f"Warning: Connected model has {in_ch}ch UNet (not inpainting). "
+                      f"Falling back to diffusers model: {inpaint_model_id}")
+                if not inpaint_model_id:
+                    inpaint_model_id = "runwayml/stable-diffusion-inpainting"
+                inpaint_pipe = load_inpainting_model(inpaint_model_id, str(device))
+        else:
+            if not inpaint_model_id:
+                inpaint_model_id = "runwayml/stable-diffusion-inpainting"
+            print(f"Warp+Inpaint pipeline - Using diffusers model: {inpaint_model_id}")
+            inpaint_pipe = load_inpainting_model(inpaint_model_id, str(device))
+
+        # 2. Process frames
+        import gc
+        from comfy.utils import ProgressBar
+
+        num_frames = image.shape[0]
+        inpaint_prompt = prompt if prompt else "high quality, detailed"
+        print(f"Warp+Inpaint - {num_frames} frame(s), {num_inference_steps} steps, "
+              f"strength={denoise_strength}, guidance={guidance_scale}")
+        print(f"Warp+Inpaint - Prompt: '{inpaint_prompt}'")
+
+        pbar = ProgressBar(num_frames)
+        stereo_list = []
+        left_list = []
+        right_list = []
+
+        for frame_idx in range(num_frames):
+            # Per-frame generator for reproducibility (seed + frame_index)
+            frame_gen = torch.Generator(device="cpu")
+            frame_gen.manual_seed(seed + frame_idx)
+
+            s, l, r = self._generate_stereo_fast_single(
+                image[frame_idx], depth_map[frame_idx], scale_factor,
+                denoise_strength, num_inference_steps, guidance_scale,
+                inpaint_pipe, inpaint_prompt, frame_gen, device
+            )
+            stereo_list.append(s)
+            left_list.append(l)
+            right_list.append(r)
+
+            pbar.update(1)
+
+            # Periodic memory cleanup
+            if (frame_idx + 1) % 8 == 0:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                gc.collect()
+
+        return (
+            torch.cat(stereo_list, dim=0),
+            torch.cat(left_list, dim=0),
+            torch.cat(right_list, dim=0),
+        )
+
+    @torch.no_grad()
+    def _generate_stereo_fast_single(
+        self, image_frame, depth_frame, scale_factor,
+        denoise_strength, num_inference_steps, guidance_scale,
+        inpaint_pipe, inpaint_prompt, generator, device
+    ):
+        """Process a single frame through the warp + inpaint pipeline."""
+        import torch.nn.functional as F
+
+        img_np = tensor_to_numpy(image_frame.unsqueeze(0))
+        depth_np = tensor_to_numpy(depth_frame.unsqueeze(0))
 
         if len(depth_np.shape) == 3 and depth_np.shape[2] == 3:
             depth_np = np.dot(depth_np[..., :3], [0.2989, 0.5870, 0.1140]).astype(np.uint8)
@@ -335,17 +422,13 @@ class StereoDiffusionNode:
         img_resized = np.array(Image.fromarray(img_np).resize((512, 512)))
         depth_resized = np.array(Image.fromarray(depth_np).resize((512, 512)))
 
-        # 3. Compute warp grid and warp with NEAREST interpolation
-        # We do our own warp instead of using apply_stereo_divergence_gpu_with_fill
-        # because we need: nearest mode (no cross-depth blending), access to the
-        # warp field for artifact detection, and border fill for gap content.
-        img_t = torch.from_numpy(img_resized).float().permute(2, 0, 1).to(device) / 255.0  # [C,H,W] 0-1
-        depth_t = torch.from_numpy(depth_resized).float().to(device)  # [H,W] 0-255
+        # Compute warp grid
+        img_t = torch.from_numpy(img_resized).float().permute(2, 0, 1).to(device) / 255.0
+        depth_t = torch.from_numpy(depth_resized).float().to(device)
 
         H, W = 512, 512
         divergence_px = (scale_factor / 100.0) * W
 
-        # Normalize depth to 0-1
         d = depth_t.clone()
         if d.max() > 1.0:
             d = d / 255.0
@@ -354,47 +437,34 @@ class StereoDiffusionNode:
             d = (d - d_min) / (d_max - d_min)
         else:
             d = torch.zeros_like(d)
-        d = d - 0.5  # convergence_point = 0.5
+        d = d - 0.5
 
-        # Compute per-pixel warp offset (in pixels)
-        pixel_offset = d * (-divergence_px)  # negative divergence for right eye
-        offset_normalized = pixel_offset / (W / 2)  # convert to grid_sample coords [-1, 1]
+        pixel_offset = d * (-divergence_px)
+        offset_normalized = pixel_offset / (W / 2)
 
-        # Build warp grid
         y_coords = torch.linspace(-1, 1, H, device=device)
         x_coords = torch.linspace(-1, 1, W, device=device)
         grid_y, grid_x = torch.meshgrid(y_coords, x_coords, indexing='ij')
         grid_x_warped = grid_x - offset_normalized
         grid = torch.stack([grid_x_warped, grid_y], dim=-1).unsqueeze(0)
 
-        # Warp image with BILINEAR for smooth results
         warped_right = F.grid_sample(
             img_t.unsqueeze(0), grid,
             mode='bilinear', padding_mode='border', align_corners=True
-        ).squeeze(0)  # [C, H, W]
+        ).squeeze(0)
 
-        # Valid mask: source coordinate is within bounds
-        valid_mask = (grid_x_warped >= -1) & (grid_x_warped <= 1)  # [H, W]
+        valid_mask = (grid_x_warped >= -1) & (grid_x_warped <= 1)
 
-        # 4. Detect disoccluded regions by comparing depth at output vs source positions
-        # Warp the depth map with nearest to see what depth each output pixel actually got
-        d_for_warp = d + 0.5  # back to 0-1 range for comparison
+        # Detect disoccluded regions
+        d_for_warp = d + 0.5
         warped_depth = F.grid_sample(
             d_for_warp.unsqueeze(0).unsqueeze(0), grid,
             mode='nearest', padding_mode='border', align_corners=True
-        ).squeeze()  # [H, W]
+        ).squeeze()
 
-        # Output pixel's own depth (what it SHOULD be)
-        output_depth = d_for_warp  # [H, W]
+        depth_diff = warped_depth - d_for_warp
+        disoccluded = (depth_diff > 0.05)
 
-        # Disocclusion: output pixel expects background (low depth) but the source
-        # pixel it sampled from is foreground (high depth). This means the actual
-        # background content was hidden behind the foreground in the source image.
-        # The threshold scales with divergence - larger divergence = wider disocclusion zones.
-        depth_diff = warped_depth - output_depth  # positive = sampled foreground for background
-        disoccluded = (depth_diff > 0.05)  # [H, W]
-
-        # Small dilation to catch edge pixels and ensure clean inpainting boundary
         if disoccluded.any():
             disoccluded_dilated = F.max_pool2d(
                 disoccluded.float().unsqueeze(0).unsqueeze(0),
@@ -402,16 +472,10 @@ class StereoDiffusionNode:
             )
             disoccluded = (disoccluded_dilated.squeeze() > 0.5)
 
-        # Combine: out-of-bounds gaps + disoccluded regions
         inpaint_mask_px = ~valid_mask | disoccluded
 
-        num_mask_pixels = inpaint_mask_px.sum().item()
-        total_pixels = H * W
-        print(f"Warp+Inpaint - {num_mask_pixels} masked pixels ({100*num_mask_pixels/total_pixels:.1f}% of image) "
-              f"(gaps + stretch artifacts)")
-
-        # If no mask pixels, just return warped image directly
-        if num_mask_pixels == 0:
+        # If no mask pixels, return warped image directly
+        if inpaint_mask_px.sum().item() == 0:
             left_img = img_resized
             right_img = (warped_right.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
             left_img = np.array(Image.fromarray(left_img).resize(original_size))
@@ -419,28 +483,24 @@ class StereoDiffusionNode:
             stereo_pair = np.hstack([left_img, right_img])
             return (numpy_to_tensor(stereo_pair), numpy_to_tensor(left_img), numpy_to_tensor(right_img))
 
-        # 5. Dilate combined mask slightly for smoother blending at boundaries
+        # Dilate mask
         dilated = F.max_pool2d(
             inpaint_mask_px.float().unsqueeze(0).unsqueeze(0),
             kernel_size=3, stride=1, padding=1
         )
         inpaint_mask_px = (dilated.squeeze() > 0.5)
 
-        # 6. Fill masked regions by interpolating between border pixels
-        # Like "Fill - Naive interpolating": find the valid pixel on each side of
-        # each gap and linearly interpolate between them.
-        filled_right = warped_right.clone()  # [C, H, W]
-        mask_2d = inpaint_mask_px  # [H, W]
+        # Fill masked regions by interpolating between border pixels
+        filled_right = warped_right.clone()
+        mask_2d = inpaint_mask_px
 
-        # Scan left-to-right: track last valid pixel color and distance
         has_left = torch.zeros(H, dtype=torch.bool, device=device)
         left_val = torch.zeros(3, H, device=device)
         left_dist = torch.zeros(H, W, device=device)
         left_colors = torch.zeros(3, H, W, device=device)
 
         for col in range(W):
-            valid_here = ~mask_2d[:, col]  # [H]
-            # Update last valid from non-masked pixels
+            valid_here = ~mask_2d[:, col]
             for c in range(3):
                 left_val[c] = torch.where(valid_here, warped_right[c, :, col], left_val[c])
             has_left = has_left | valid_here
@@ -452,7 +512,6 @@ class StereoDiffusionNode:
                 left_dist[:, col] = torch.where(valid_here, torch.zeros(H, device=device),
                                                 left_dist[:, col - 1] + 1)
 
-        # Scan right-to-left
         has_right = torch.zeros(H, dtype=torch.bool, device=device)
         right_val = torch.zeros(3, H, device=device)
         right_dist = torch.zeros(H, W, device=device)
@@ -471,57 +530,42 @@ class StereoDiffusionNode:
                 right_dist[:, col] = torch.where(valid_here, torch.zeros(H, device=device),
                                                  right_dist[:, col + 1] + 1)
 
-        # Compute interpolation weight
-        total_dist = left_dist + right_dist
-        total_dist = torch.clamp(total_dist, min=1.0)
-        t = left_dist / total_dist  # [H, W], 0=left border, 1=right border
-
-        # Handle edge cases: if only one border exists, use it entirely
-        # has_left/has_right are per-row; expand to [H, W]
-        only_right = (~has_left).unsqueeze(1).expand_as(t)  # no left border found in this row
-        only_left = (~has_right).unsqueeze(1).expand_as(t)   # no right border found in this row
+        total_dist = torch.clamp(left_dist + right_dist, min=1.0)
+        t = left_dist / total_dist
+        only_right = (~has_left).unsqueeze(1).expand_as(t)
+        only_left = (~has_right).unsqueeze(1).expand_as(t)
         t = torch.where(only_right, torch.ones_like(t), t)
         t = torch.where(only_left, torch.zeros_like(t), t)
 
-        # Apply interpolation only to masked pixels
         for c in range(3):
             interpolated = left_colors[c] * (1 - t) + right_colors[c] * t
             filled_right[c] = torch.where(mask_2d, interpolated, warped_right[c])
 
-        # 7. Prepare PIL images for inpainting pipeline
-        # The inpainting model expects PIL Image inputs
+        # Prepare PIL images for inpainting
         warped_pil = Image.fromarray(
             (filled_right.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
         )
-        # Mask: white = inpaint, black = keep (PIL convention for SD inpainting)
         mask_np = (inpaint_mask_px.cpu().numpy() * 255).astype(np.uint8)
         mask_pil = Image.fromarray(mask_np, mode='L')
 
-        # 8. Run inpainting pipeline
-        inpaint_prompt = prompt if prompt else "high quality, detailed"
-        print(f"Warp+Inpaint - Running inpainting with {num_steps} steps, "
-              f"strength={denoise_strength}, guidance={guidance_scale}")
-        print(f"Warp+Inpaint - Prompt: '{inpaint_prompt}'")
-
+        # Run inpainting
         result = inpaint_pipe(
             prompt=inpaint_prompt,
             image=warped_pil,
             mask_image=mask_pil,
-            num_inference_steps=num_steps,
+            num_inference_steps=num_inference_steps,
             guidance_scale=guidance_scale,
             strength=denoise_strength,
+            generator=generator,
         )
-        inpainted_pil = result.images[0]
-        inpainted_np = np.array(inpainted_pil)
+        inpainted_np = np.array(result.images[0])
 
-        # 9. Pixel-space final blend: use original warped pixels for non-masked areas
-        # This avoids any VAE quality loss in regions that don't need inpainting.
+        # Pixel-space final blend
         warped_np = (warped_right.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-        mask_bool = inpaint_mask_px.cpu().numpy()  # [H, W]
-        mask_3ch = np.stack([mask_bool] * 3, axis=-1)  # [H, W, 3]
+        mask_bool = inpaint_mask_px.cpu().numpy()
+        mask_3ch = np.stack([mask_bool] * 3, axis=-1)
         right_result = np.where(mask_3ch, inpainted_np, warped_np)
 
-        # 10. Left eye = original, right eye = warped + inpainted
         left_img = np.array(Image.fromarray(img_resized).resize(original_size))
         right_img = np.array(Image.fromarray(right_result).resize(original_size))
         stereo_pair = np.hstack([left_img, right_img])
@@ -541,7 +585,8 @@ class StereoDiffusionNode:
         deblur: bool,
         num_inference_steps: int,
         guidance_scale: float,
-        device: torch.device
+        device: torch.device,
+        generator: torch.Generator = None
     ):
         """Generate stereo image pair using diffusion with latent shifting."""
 
@@ -565,7 +610,7 @@ class StereoDiffusionNode:
         text_embeddings = model.text_encoder(text_input.input_ids.to(model.device))[0]
 
         # Initialize latents
-        _, latents = init_latent(latent, model, height, width, None, batch_size)
+        _, latents = init_latent(latent, model, height, width, generator, batch_size)
         model.scheduler.set_timesteps(num_inference_steps)
 
         # Resize disparity to latent size

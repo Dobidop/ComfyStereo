@@ -171,7 +171,7 @@ class VideoCapture:
         """Restart video from beginning"""
         self.capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
         self.current_frame = 0
-        print("   Video restarted")
+        """print("   Video restarted")"""
 
     def release(self):
         """Release video capture resources"""
