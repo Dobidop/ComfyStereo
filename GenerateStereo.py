@@ -161,7 +161,7 @@ class StereoImageNode:
 
             # Use fully GPU-accelerated path for gpu_warp technique
             if fill_technique == 'gpu_warp':
-                results_tensors, left_depth, right_depth = sig.create_stereoimages_gpu(
+                results_tensors, left_depth, right_depth, disocclusion_mask = sig.create_stereoimages_gpu(
                     img_tensor, dm_tensor, divergence, separation,
                     [modes], stereo_balance, stereo_offset_exponent, convergence_point,
                     depth_blur_strength, depth_blur_edge_threshold, depth_map_blur
@@ -189,9 +189,9 @@ class StereoImageNode:
                 depthmap_left_batch.append(np2tensor(left_depth_np))
                 depthmap_right_batch.append(np2tensor(right_depth_np))
 
-                # Generate mask (for GPU warp, there are no unfilled pixels due to border padding)
-                # Use original single-eye dimensions (correct for all modes: SBS, TB, anaglyph)
-                mask = torch.zeros((1, img_tensor.shape[1], img_tensor.shape[2]))
+                # Use disocclusion mask from GPU warp (True = disoccluded/filled pixel)
+                # Convert bool [H, W] to float [1, H, W] for ComfyUI mask format
+                mask = disocclusion_mask.float().unsqueeze(0).cpu()
                 mask_batch.append(mask)
 
                 # Memory management for large batches - concatenate and clear
