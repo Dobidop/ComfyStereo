@@ -139,6 +139,62 @@ def _normalize_depth_01(depth_tensor, convergence_point=0.5):
     return d
 
 
+def compute_forward_mask_gpu(depth_tensor, divergence_px, separation_px,
+                             stereo_offset_exponent, convergence_point, device):
+    """
+    Compute pixel-precise gap mask using forward-mapping math, fully vectorized.
+
+    Instead of actually moving pixels (which requires slow per-column loops),
+    we just compute WHERE each source pixel would land via scatter_add_.
+    Destinations with zero hits are gaps. Single GPU kernel, no Python loops.
+
+    Args:
+        depth_tensor: [H, W] depth map (0-255 or 0-1)
+        divergence_px: Horizontal shift in pixels
+        separation_px: Additional separation in pixels
+        stereo_offset_exponent: Power curve for depth-to-offset
+        convergence_point: Depth that maps to zero offset
+        device: torch device
+
+    Returns:
+        gap_mask: [H, W] bool tensor, True = gap (no source pixel lands here)
+    """
+    H, W = depth_tensor.shape
+
+    # Normalize depth to 0-1
+    d = depth_tensor.clone()
+    if d.max() > 1.0:
+        d = d / 255.0
+    d_min, d_max = d.min(), d.max()
+    if d_max - d_min > 1e-6:
+        normalized_depth = (d - d_min) / (d_max - d_min)
+    else:
+        normalized_depth = torch.zeros_like(d)
+
+    # Apply convergence and exponent (same formula as all warp functions)
+    depth_shifted = normalized_depth - convergence_point
+    sign = torch.sign(depth_shifted)
+    abs_depth = torch.abs(depth_shifted)
+    offset_depth = sign * torch.pow(abs_depth, stereo_offset_exponent)
+
+    # Compute destination column for each source pixel [H, W]
+    pixel_offset = offset_depth * divergence_px + separation_px
+    col_indices = torch.arange(W, device=device, dtype=torch.float32).unsqueeze(0).expand(H, W)
+    dest_cols = (col_indices + pixel_offset).long()
+
+    # Mark which destinations receive at least one source pixel
+    valid = (dest_cols >= 0) & (dest_cols < W)
+    dest_clamped = dest_cols.clamp(0, W - 1)
+
+    # scatter_add_ accumulates: dest positions with >0 valid sources get count > 0
+    hit_count = torch.zeros(H, W, device=device)
+    hit_count.scatter_add_(1, dest_clamped, valid.float())
+
+    gap_mask = hit_count < 0.5  # True = no source pixel lands here
+
+    return gap_mask
+
+
 def _warp_with_grid(image_tensor, depth_tensor, divergence_px, separation_px,
                     stereo_offset_exponent, convergence_point, device):
     """
@@ -186,14 +242,17 @@ def _warp_with_grid(image_tensor, depth_tensor, divergence_px, separation_px,
     return warped, valid_mask, grid, grid_x_warped
 
 
-def detect_disocclusions_gpu(depth_tensor, grid, grid_x_warped, device, threshold=0.05):
+def detect_disocclusions_gpu(depth_tensor, grid, grid_x_warped, device, threshold=0.02):
     """
-    Detect disoccluded regions by comparing depth at output vs source positions.
+    Detect disoccluded regions using two complementary signals:
 
-    At depth discontinuities, inverse warping samples foreground content where
-    background should be (the background was hidden in the source). We detect
-    this by warping the depth map and comparing: if the sampled depth is
-    significantly greater than the output pixel's own depth, it's disoccluded.
+    1. Depth comparison: Warp the depth map with nearest mode and compare.
+       If sampled depth >> output depth, the pixel sampled foreground for a
+       background position (disoccluded).
+
+    2. Warp gradient: Where the warp field stretches horizontally (derivative > 1),
+       pixels are being duplicated/stretched. This catches disocclusions that
+       the depth comparison misses due to threshold sensitivity.
 
     Args:
         depth_tensor: Normalized depth [H, W] in 0-1 range
@@ -205,93 +264,121 @@ def detect_disocclusions_gpu(depth_tensor, grid, grid_x_warped, device, threshol
     Returns:
         disocclusion_mask: [H, W] bool tensor, True = disoccluded pixel
     """
-    # Warp the depth map with nearest to see what depth each output pixel sampled
+    H, W = depth_tensor.shape
+
+    # Signal 1: Depth comparison
     warped_depth = F.grid_sample(
         depth_tensor.unsqueeze(0).unsqueeze(0), grid,
         mode='nearest', padding_mode='border', align_corners=True
     ).squeeze()  # [H, W]
 
-    # Disocclusion: output expects background but sampled foreground
     depth_diff = warped_depth - depth_tensor
-    disoccluded = (depth_diff > threshold)
+    depth_disoccluded = (depth_diff > threshold)
 
-    # Small dilation to catch edge pixels
-    if disoccluded.any():
-        disoccluded = (F.max_pool2d(
-            disoccluded.float().unsqueeze(0).unsqueeze(0),
-            kernel_size=3, stride=1, padding=1
-        ).squeeze() > 0.5)
+    # Signal 2: Warp gradient - detect stretched/duplicated regions
+    # Compute horizontal derivative of the warp field
+    # Where grid_x changes slowly across output columns, multiple outputs sample
+    # from the same source region (stretching/duplication)
+    warp_grad = torch.zeros_like(grid_x_warped)
+    # Forward difference: how much the source x changes per output column
+    warp_grad[:, :-1] = torch.abs(grid_x_warped[:, 1:] - grid_x_warped[:, :-1])
+    warp_grad[:, -1] = warp_grad[:, -2]
+
+    # Normal warp has gradient ~= pixel_step (2/W for normalized coords)
+    # Stretched regions have much larger gradient (source jumps across depth edge)
+    pixel_step = 2.0 / W
+    stretch_disoccluded = (warp_grad > pixel_step * 3.0)
+
+    # Combine both signals - no dilation, keep pixel-precise like forward mapping
+    disoccluded = depth_disoccluded | stretch_disoccluded
 
     return disoccluded
 
 
-def interpolate_fill_gpu(image_tensor, mask, device):
+def interpolate_fill_gpu(image_tensor, mask, device, depth_tensor=None):
     """
-    Fill masked regions by interpolating between nearest valid pixels on each side.
+    Fill masked regions biased toward the background side. Fully vectorized.
 
-    Similar to 'Fill - Naive interpolating' but on GPU. For each horizontal gap,
-    finds the valid pixel on each side and linearly interpolates between them.
+    Uses cummax + gather to find nearest valid pixels on each side in O(1)
+    GPU operations (no Python loops). Then interpolates with background bias.
 
     Args:
         image_tensor: [C, H, W] image tensor
         mask: [H, W] bool tensor, True = needs filling
         device: torch device
+        depth_tensor: [H, W] normalized depth (optional, for fg/bg detection)
 
     Returns:
         filled: [C, H, W] tensor with gaps filled
     """
     C, H, W = image_tensor.shape
-    filled = image_tensor.clone()
+    valid = ~mask  # True where pixel has real data
 
-    # Left-to-right scan: track last valid pixel color and distance
-    has_left = torch.zeros(H, dtype=torch.bool, device=device)
-    left_val = torch.zeros(C, H, device=device)
-    left_dist = torch.zeros(H, W, device=device)
-    left_colors = torch.zeros(C, H, W, device=device)
+    # Column indices [H, W]
+    cols = torch.arange(W, device=device).unsqueeze(0).expand(H, W)
 
-    for col in range(W):
-        valid_here = ~mask[:, col]
-        for c in range(C):
-            left_val[c] = torch.where(valid_here, image_tensor[c, :, col], left_val[c])
-        has_left = has_left | valid_here
-        left_colors[:, :, col] = left_val
-        if col == 0:
-            left_dist[:, col] = torch.where(valid_here, torch.zeros(H, device=device),
-                                            torch.ones(H, device=device))
-        else:
-            left_dist[:, col] = torch.where(valid_here, torch.zeros(H, device=device),
-                                            left_dist[:, col - 1] + 1)
+    # --- Left-to-right: find nearest valid pixel to the left ---
+    # For valid positions store column index, for invalid store -1
+    left_valid_col = torch.where(valid, cols, torch.full_like(cols, -1))
+    # cummax propagates the last valid column index forward
+    left_nearest_col, _ = torch.cummax(left_valid_col, dim=1)
+    left_dist = (cols - left_nearest_col).float()
+    has_left = left_nearest_col >= 0
 
-    # Right-to-left scan
-    has_right = torch.zeros(H, dtype=torch.bool, device=device)
-    right_val = torch.zeros(C, H, device=device)
-    right_dist = torch.zeros(H, W, device=device)
-    right_colors = torch.zeros(C, H, W, device=device)
+    # --- Right-to-left: find nearest valid pixel to the right ---
+    # Flip, cummax, flip back. Use column indices so larger = more rightward
+    right_valid_col_flip = torch.where(
+        torch.flip(valid, [1]),
+        torch.flip(cols, [1]),
+        torch.full_like(cols, -1)
+    )
+    right_nearest_flip, _ = torch.cummax(right_valid_col_flip, dim=1)
+    right_nearest_col = torch.flip(right_nearest_flip, [1])
+    right_dist = (right_nearest_col - cols).float()
+    has_right = right_nearest_col >= 0
 
-    for col in range(W - 1, -1, -1):
-        valid_here = ~mask[:, col]
-        for c in range(C):
-            right_val[c] = torch.where(valid_here, image_tensor[c, :, col], right_val[c])
-        has_right = has_right | valid_here
-        right_colors[:, :, col] = right_val
-        if col == W - 1:
-            right_dist[:, col] = torch.where(valid_here, torch.zeros(H, device=device),
-                                             torch.ones(H, device=device))
-        else:
-            right_dist[:, col] = torch.where(valid_here, torch.zeros(H, device=device),
-                                             right_dist[:, col + 1] + 1)
+    # Gather colors at nearest valid positions
+    left_idx = left_nearest_col.clamp(0, W - 1).unsqueeze(0).expand(C, H, W)
+    right_idx = right_nearest_col.clamp(0, W - 1).unsqueeze(0).expand(C, H, W)
+    left_colors = image_tensor.gather(2, left_idx)
+    right_colors = image_tensor.gather(2, right_idx)
 
-    # Interpolation weight
+    # Interpolation weight: 0 = left border, 1 = right border
     total_dist = torch.clamp(left_dist + right_dist, min=1.0)
     t = left_dist / total_dist
-    only_right = (~has_left).unsqueeze(1).expand_as(t)
-    only_left = (~has_right).unsqueeze(1).expand_as(t)
-    t = torch.where(only_right, torch.ones_like(t), t)
-    t = torch.where(only_left, torch.zeros_like(t), t)
 
-    for c in range(C):
-        interpolated = left_colors[c] * (1 - t) + right_colors[c] * t
-        filled[c] = torch.where(mask, interpolated, image_tensor[c])
+    # Handle edges with only one valid side
+    t = torch.where(~has_left, torch.ones_like(t), t)
+    t = torch.where(~has_right, torch.zeros_like(t), t)
+
+    # If we have depth info, bias fill toward background (lower depth) border
+    if depth_tensor is not None:
+        left_depth_idx = left_nearest_col.clamp(0, W - 1)
+        right_depth_idx = right_nearest_col.clamp(0, W - 1)
+        left_depth_at_border = depth_tensor.gather(1, left_depth_idx)
+        right_depth_at_border = depth_tensor.gather(1, right_depth_idx)
+
+        # left_is_fg: True where left border is foreground (higher depth)
+        left_is_fg = left_depth_at_border > right_depth_at_border
+        # Power curve biases away from foreground
+        t_biased = torch.where(left_is_fg, t.pow(1.5), 1.0 - (1.0 - t).pow(1.5))
+        t = torch.where(mask, t_biased, t)
+
+    # Expand t for broadcasting with [C, H, W]
+    t_expanded = t.unsqueeze(0)
+    interpolated = left_colors * (1.0 - t_expanded) + right_colors * t_expanded
+    filled = torch.where(mask.unsqueeze(0), interpolated, image_tensor)
+
+    # Vertical smoothing on filled regions to reduce horizontal streak artifacts
+    if mask.any():
+        v_kernel = torch.tensor([0.25, 0.5, 0.25], device=device, dtype=filled.dtype)
+        v_kernel = v_kernel.view(1, 1, 3, 1)
+        filled_4d = filled.unsqueeze(0)
+        # Apply same kernel to all channels using groups
+        v_kernel_c = v_kernel.expand(C, 1, 3, 1)
+        blurred = F.conv2d(filled_4d, v_kernel_c, padding=(1, 0), groups=C)
+        blurred = blurred.squeeze(0)
+        filled = torch.where(mask.unsqueeze(0), blurred, filled)
 
     return filled
 
@@ -453,38 +540,42 @@ def create_stereoimages_gpu(image_tensor, depth_tensor, divergence, separation=0
     left_divergence_px = (left_divergence / 100.0) * W
     right_divergence_px = (right_divergence / 100.0) * W
 
-    # Generate left and right eye views using GPU warping with disocclusion handling
+    # Hybrid approach: grid_sample for fast pixel warping + forward-mapping mask
+    # for pixel-precise gap detection. Best of both worlds: GPU speed + quality.
     left_mask = torch.zeros(H, W, dtype=torch.bool, device=device)
     right_mask = torch.zeros(H, W, dtype=torch.bool, device=device)
 
     if left_divergence < 0.001:
         left_eye = image_tensor
     else:
-        left_eye, left_valid, left_grid, left_grid_x = _warp_with_grid(
+        # Fast inverse warp for pixel values (single grid_sample call)
+        left_eye = apply_stereo_divergence_gpu(
             image_tensor, left_depth, +left_divergence_px, -separation_px,
+            stereo_offset_exponent, convergence_point)
+        # Pixel-precise gap mask from forward mapping math (single scatter call)
+        left_mask = compute_forward_mask_gpu(
+            left_depth, +left_divergence_px, -separation_px,
             stereo_offset_exponent, convergence_point, device)
-        # Detect disocclusions and fill
-        left_depth_norm = left_depth / 255.0 if left_depth.max() > 1.0 else left_depth
-        left_depth_norm = _normalize_depth_01(left_depth_norm, convergence_point)
-        left_disoccluded = detect_disocclusions_gpu(left_depth_norm, left_grid, left_grid_x, device)
-        left_mask = ~left_valid | left_disoccluded
         if left_mask.any():
-            left_eye = interpolate_fill_gpu(left_eye, left_mask, device)
+            left_depth_norm = _normalize_depth_01(
+                left_depth / 255.0 if left_depth.max() > 1.0 else left_depth)
+            left_eye = interpolate_fill_gpu(left_eye, left_mask, device, depth_tensor=left_depth_norm)
 
     if right_divergence < 0.001:
         right_eye = image_tensor
     else:
-        right_eye, right_valid, right_grid, right_grid_x = _warp_with_grid(
+        right_eye = apply_stereo_divergence_gpu(
             image_tensor, right_depth, -right_divergence_px, separation_px,
+            stereo_offset_exponent, convergence_point)
+        right_mask = compute_forward_mask_gpu(
+            right_depth, -right_divergence_px, separation_px,
             stereo_offset_exponent, convergence_point, device)
-        right_depth_norm = right_depth / 255.0 if right_depth.max() > 1.0 else right_depth
-        right_depth_norm = _normalize_depth_01(right_depth_norm, convergence_point)
-        right_disoccluded = detect_disocclusions_gpu(right_depth_norm, right_grid, right_grid_x, device)
-        right_mask = ~right_valid | right_disoccluded
         if right_mask.any():
-            right_eye = interpolate_fill_gpu(right_eye, right_mask, device)
+            right_depth_norm = _normalize_depth_01(
+                right_depth / 255.0 if right_depth.max() > 1.0 else right_depth)
+            right_eye = interpolate_fill_gpu(right_eye, right_mask, device, depth_tensor=right_depth_norm)
 
-    # Combined disocclusion mask (both eyes)
+    # Combined gap mask (both eyes)
     combined_mask = left_mask | right_mask
 
     # Generate output modes

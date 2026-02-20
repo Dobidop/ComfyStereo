@@ -62,7 +62,7 @@ class StereoImageNode:
                 "separation": ("FLOAT", {"default": 0, "min": -5, "max": 5, "step": 0.01}),
                 "stereo_balance": ("FLOAT", {"default": 0, "min": -0.95, "max": 0.95, "step": 0.05}),
                 "convergence_point": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05}),
-                "stereo_offset_exponent": ("FLOAT", {"default": 2, "min": 1, "max": 2, "step": 1}),
+                "stereo_offset_exponent": ("FLOAT", {"default": 2, "min": 0.1, "max": 2, "step": 0.11}),
                 "depth_map_blur": ("BOOLEAN", {"default": True}),
                 "depth_blur_edge_threshold": ("FLOAT", {"default": 6, "min": 0.1, "max": 15, "step": 0.1}),
                 "batch_size": ("INT", {"default": 512, "min": 1, "max": 512, "step": 1, "tooltip": "Number of frames to process before clearing GPU memory. Lower values use less memory but may be slower."}),
