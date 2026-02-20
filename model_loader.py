@@ -6,7 +6,7 @@ Functions for loading Stable Diffusion models from HuggingFace or local paths.
 
 import os
 import torch
-from diffusers import StableDiffusionPipeline, DDIMScheduler, EulerDiscreteScheduler
+from diffusers import StableDiffusionPipeline, StableDiffusionInpaintPipeline, DDIMScheduler, EulerDiscreteScheduler
 
 
 # Global model cache
@@ -91,3 +91,51 @@ def load_sd_model(model_id_or_path: str = "runwayml/stable-diffusion-v1-5", devi
 
     _model_cache[cache_key] = model
     return model
+
+
+def load_inpainting_model(model_id_or_path: str = "runwayml/stable-diffusion-inpainting",
+                           device: str = "cuda"):
+    """
+    Load or retrieve cached Stable Diffusion Inpainting model.
+
+    Args:
+        model_id_or_path: HuggingFace model ID or local path to an inpainting model.
+        device: Device to load the model on ("cuda" or "cpu")
+
+    Returns:
+        StableDiffusionInpaintPipeline instance
+    """
+    global _model_cache
+
+    cache_key = f"inpaint:{model_id_or_path}"
+    if cache_key in _model_cache:
+        return _model_cache[cache_key]
+
+    is_local = os.path.isdir(model_id_or_path)
+    model_dtype = torch.float16 if device != "cpu" else torch.float32
+
+    try:
+        pipe = StableDiffusionInpaintPipeline.from_pretrained(
+            model_id_or_path,
+            torch_dtype=model_dtype,
+            local_files_only=is_local,
+            safety_checker=None,
+            requires_safety_checker=False,
+        ).to(device)
+    except Exception as e:
+        print(f"Failed to load inpainting model: {e}")
+        print("Attempting to download from HuggingFace...")
+        pipe = StableDiffusionInpaintPipeline.from_pretrained(
+            model_id_or_path,
+            torch_dtype=model_dtype,
+            safety_checker=None,
+            requires_safety_checker=False,
+        ).to(device)
+
+    try:
+        pipe.disable_xformers_memory_efficient_attention()
+    except AttributeError:
+        pass
+
+    _model_cache[cache_key] = pipe
+    return pipe

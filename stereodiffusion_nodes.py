@@ -21,7 +21,7 @@ from einops import rearrange
 
 # Import from local modules
 from .model_wrappers import ComfyUIModelWrapper
-from .model_loader import load_sd_model
+from .model_loader import load_sd_model, load_inpainting_model
 from .inversion import NullInversion, EmptyControl
 from .stereo_utils import (
     stereo_shift_torch,
@@ -96,9 +96,9 @@ class StereoDiffusionNode:
                     "default": False,
                     "tooltip": "Add noise to unfilled regions to avoid blurring"
                 }),
-                "pipeline_mode": (["Standard (DDIM)", "Fast (img2img)"], {
+                "pipeline_mode": (["Standard (DDIM)", "Fast (Warp + Inpaint)"], {
                     "default": "Standard (DDIM)",
-                    "tooltip": "Standard: DDIM inversion (high quality, slow). Fast: img2img pipeline for turbo/LCM models (fast, good quality)"
+                    "tooltip": "Standard: DDIM inversion (high quality, slow). Fast: Warp image with depth, then AI-inpaint only the gap regions (fast, works with turbo/LCM models)"
                 }),
                 "guidance_scale": ("FLOAT", {
                     "default": 7.5,
@@ -141,6 +141,15 @@ class StereoDiffusionNode:
                     "default": "runwayml/stable-diffusion-v1-5",
                     "tooltip": "HuggingFace model ID or local path. Standard: 'runwayml/stable-diffusion-v1-5', Turbo: 'stabilityai/sd-turbo'"
                 }),
+                "inpaint_model_id": ("STRING", {
+                    "default": "runwayml/stable-diffusion-inpainting",
+                    "tooltip": "HuggingFace inpainting model ID (Fast mode). Default: 'runwayml/stable-diffusion-inpainting'"
+                }),
+                "prompt": ("STRING", {
+                    "default": "",
+                    "multiline": True,
+                    "tooltip": "Optional text prompt to guide inpainting (Fast mode). Describe the image content for better gap filling."
+                }),
             }
         }
 
@@ -165,15 +174,17 @@ class StereoDiffusionNode:
         model=None,
         clip=None,
         vae=None,
-        model_id: str = ""
+        model_id: str = "",
+        inpaint_model_id: str = "runwayml/stable-diffusion-inpainting",
+        prompt: str = ""
     ):
         # Exit inference mode for the entire function - needed for null-text optimization
         with torch.inference_mode(False):
-            if pipeline_mode == "Fast (img2img)":
+            if pipeline_mode == "Fast (Warp + Inpaint)":
                 return self._generate_stereo_fast(
                     image, depth_map, scale_factor, direction, deblur,
                     denoise_strength, num_steps, guidance_scale,
-                    model, clip, vae, model_id
+                    model, clip, vae, inpaint_model_id, prompt
                 )
             else:
                 return self._generate_stereo_impl(
@@ -290,31 +301,28 @@ class StereoDiffusionNode:
         model,
         clip,
         vae,
-        model_id: str
+        inpaint_model_id: str,
+        prompt: str
     ):
-        """Fast stereo pipeline using img2img approach. No DDIM inversion needed.
+        """Warp + Inpaint pipeline for fast stereo generation.
 
-        Works with turbo/LCM/lightning models by:
-        1. VAE-encoding the input image to a clean latent
-        2. Applying stereo shift on the clean latent
-        3. Adding noise (controlled by denoise_strength)
-        4. Denoising for a few steps with BNAttention for cross-view consistency
+        1. Warps the image using depth to create the right eye view (GPU grid_sample)
+        2. Identifies disoccluded gap regions from the warping
+        3. Uses a diffusion model to inpaint ONLY the gap regions (repaint technique)
+        4. Left eye = original image (untouched)
+
+        This preserves the original image perfectly in non-gap areas and only
+        uses AI to fill the small disoccluded strips.
         """
+        import torch.nn.functional as F
+
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        use_cfg = guidance_scale > 1.0
 
-        # 1. Load model
-        use_comfyui_model = model is not None and clip is not None and vae is not None
-
-        if use_comfyui_model:
-            ldm_stable = ComfyUIModelWrapper(model, clip, vae, device=str(device))
-            ldm_stable.set_scheduler_for_mode("fast")
-            print(f"Fast pipeline - Detected model type: {ldm_stable.model_type}")
-        else:
-            if not model_id:
-                model_id = "stabilityai/sd-turbo"
-            print(f"Fast pipeline - Using diffusers model: {model_id}")
-            ldm_stable = load_sd_model(model_id, str(device), scheduler_type="euler")
+        # 1. Load inpainting model
+        if not inpaint_model_id:
+            inpaint_model_id = "runwayml/stable-diffusion-inpainting"
+        print(f"Warp+Inpaint pipeline - Using inpainting model: {inpaint_model_id}")
+        inpaint_pipe = load_inpainting_model(inpaint_model_id, str(device))
 
         # 2. Prepare inputs
         img_np = tensor_to_numpy(image)
@@ -323,127 +331,202 @@ class StereoDiffusionNode:
         if len(depth_np.shape) == 3 and depth_np.shape[2] == 3:
             depth_np = np.dot(depth_np[..., :3], [0.2989, 0.5870, 0.1140]).astype(np.uint8)
 
-        original_size = (img_np.shape[1], img_np.shape[0])
+        original_size = (img_np.shape[1], img_np.shape[0])  # (W, H)
         img_resized = np.array(Image.fromarray(img_np).resize((512, 512)))
         depth_resized = np.array(Image.fromarray(depth_np).resize((512, 512)))
 
-        # 3. VAE encode to get clean latent z_0
-        model_dtype = next(ldm_stable.vae.parameters()).dtype
-        img_tensor = torch.from_numpy(img_resized).float() / 127.5 - 1.0
-        img_tensor = img_tensor.permute(2, 0, 1).unsqueeze(0).to(device).to(model_dtype)
-        z_0 = ldm_stable.vae.encode(img_tensor)['latent_dist'].mean
-        z_0 = z_0 * 0.18215
+        # 3. Compute warp grid and warp with NEAREST interpolation
+        # We do our own warp instead of using apply_stereo_divergence_gpu_with_fill
+        # because we need: nearest mode (no cross-depth blending), access to the
+        # warp field for artifact detection, and border fill for gap content.
+        img_t = torch.from_numpy(img_resized).float().permute(2, 0, 1).to(device) / 255.0  # [C,H,W] 0-1
+        depth_t = torch.from_numpy(depth_resized).float().to(device)  # [H,W] 0-255
 
-        # 4. Prepare disparity in latent space
-        depth_tensor = torch.tensor(depth_resized, device=device, dtype=torch.float32) / 255.0
-        disp = _norm_depth(depth_tensor.unsqueeze(0))
-        disp_latent = torch.nn.functional.interpolate(
-            disp.unsqueeze(1), size=[64, 64], mode="bicubic", align_corners=False
-        ).squeeze(1)
+        H, W = 512, 512
+        divergence_px = (scale_factor / 100.0) * W
 
-        # 5. Apply stereo shift to clean latent
-        # stereo_shift_torch returns [2, C, 64, 64] -> [left (original), right (shifted)]
-        z_0_stereo = stereo_shift_torch(z_0, disp_latent, scale_factor=scale_factor)
-        mask = z_0_stereo[1:, 0, ...] != 0
-        mask = rearrange(mask, 'b h w -> b () h w').repeat(1, 4, 1, 1)
+        # Normalize depth to 0-1
+        d = depth_t.clone()
+        if d.max() > 1.0:
+            d = d / 255.0
+        d_min, d_max = d.min(), d.max()
+        if d_max - d_min > 1e-6:
+            d = (d - d_min) / (d_max - d_min)
+        else:
+            d = torch.zeros_like(d)
+        d = d - 0.5  # convergence_point = 0.5
 
-        if deblur:
-            noise_fill = torch.randn_like(z_0_stereo[1:])
-            z_0_stereo[1:][~mask] = noise_fill[~mask]
+        # Compute per-pixel warp offset (in pixels)
+        pixel_offset = d * (-divergence_px)  # negative divergence for right eye
+        offset_normalized = pixel_offset / (W / 2)  # convert to grid_sample coords [-1, 1]
 
-        # 6. Add noise based on denoise_strength
-        ldm_stable.scheduler.set_timesteps(num_steps, device=device)
-        timesteps = ldm_stable.scheduler.timesteps
+        # Build warp grid
+        y_coords = torch.linspace(-1, 1, H, device=device)
+        x_coords = torch.linspace(-1, 1, W, device=device)
+        grid_y, grid_x = torch.meshgrid(y_coords, x_coords, indexing='ij')
+        grid_x_warped = grid_x - offset_normalized
+        grid = torch.stack([grid_x_warped, grid_y], dim=-1).unsqueeze(0)
 
-        # Determine start timestep from denoise_strength
-        # With denoise_strength=1.0, start from the first (noisiest) timestep
-        # With denoise_strength=0.5, skip the first half of timesteps
-        start_step_idx = max(0, int(len(timesteps) * (1.0 - denoise_strength)))
-        t_start = timesteps[start_step_idx]
-        active_timesteps = timesteps[start_step_idx:]
+        # Warp image with BILINEAR for smooth results
+        warped_right = F.grid_sample(
+            img_t.unsqueeze(0), grid,
+            mode='bilinear', padding_mode='border', align_corners=True
+        ).squeeze(0)  # [C, H, W]
 
-        print(f"Fast pipeline - {len(active_timesteps)} active denoising steps "
-              f"(from {num_steps} total, denoise_strength={denoise_strength})")
+        # Valid mask: source coordinate is within bounds
+        valid_mask = (grid_x_warped >= -1) & (grid_x_warped <= 1)  # [H, W]
 
-        noise = torch.randn_like(z_0_stereo)
-        # Ensure z_0_stereo is on the right device/dtype before adding noise
-        z_0_stereo = z_0_stereo.to(device)
-        # add_noise expects timesteps as a 1D tensor, not a scalar
-        t_start_tensor = t_start.unsqueeze(0) if t_start.dim() == 0 else t_start
-        latents = ldm_stable.scheduler.add_noise(z_0_stereo, noise, t_start_tensor)
+        # 4. Detect disoccluded regions by comparing depth at output vs source positions
+        # Warp the depth map with nearest to see what depth each output pixel actually got
+        d_for_warp = d + 0.5  # back to 0-1 range for comparison
+        warped_depth = F.grid_sample(
+            d_for_warp.unsqueeze(0).unsqueeze(0), grid,
+            mode='nearest', padding_mode='border', align_corners=True
+        ).squeeze()  # [H, W]
 
-        # 7. Register BNAttention for cross-view consistency
-        editor = BNAttention(
-            start_step=0,
-            total_steps=len(active_timesteps),
-            direction=direction,
-            use_cfg=use_cfg
+        # Output pixel's own depth (what it SHOULD be)
+        output_depth = d_for_warp  # [H, W]
+
+        # Disocclusion: output pixel expects background (low depth) but the source
+        # pixel it sampled from is foreground (high depth). This means the actual
+        # background content was hidden behind the foreground in the source image.
+        # The threshold scales with divergence - larger divergence = wider disocclusion zones.
+        depth_diff = warped_depth - output_depth  # positive = sampled foreground for background
+        disoccluded = (depth_diff > 0.05)  # [H, W]
+
+        # Small dilation to catch edge pixels and ensure clean inpainting boundary
+        if disoccluded.any():
+            disoccluded_dilated = F.max_pool2d(
+                disoccluded.float().unsqueeze(0).unsqueeze(0),
+                kernel_size=3, stride=1, padding=1
+            )
+            disoccluded = (disoccluded_dilated.squeeze() > 0.5)
+
+        # Combine: out-of-bounds gaps + disoccluded regions
+        inpaint_mask_px = ~valid_mask | disoccluded
+
+        num_mask_pixels = inpaint_mask_px.sum().item()
+        total_pixels = H * W
+        print(f"Warp+Inpaint - {num_mask_pixels} masked pixels ({100*num_mask_pixels/total_pixels:.1f}% of image) "
+              f"(gaps + stretch artifacts)")
+
+        # If no mask pixels, just return warped image directly
+        if num_mask_pixels == 0:
+            left_img = img_resized
+            right_img = (warped_right.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            left_img = np.array(Image.fromarray(left_img).resize(original_size))
+            right_img = np.array(Image.fromarray(right_img).resize(original_size))
+            stereo_pair = np.hstack([left_img, right_img])
+            return (numpy_to_tensor(stereo_pair), numpy_to_tensor(left_img), numpy_to_tensor(right_img))
+
+        # 5. Dilate combined mask slightly for smoother blending at boundaries
+        dilated = F.max_pool2d(
+            inpaint_mask_px.float().unsqueeze(0).unsqueeze(0),
+            kernel_size=3, stride=1, padding=1
         )
-        register_attention_editor_diffusers(ldm_stable, editor)
+        inpaint_mask_px = (dilated.squeeze() > 0.5)
 
-        # 8. Get text embeddings
-        prompt = ""
-        batch_size = 2  # left + right views
-        text_input = ldm_stable.tokenizer(
-            [prompt] * batch_size,
-            padding="max_length",
-            max_length=ldm_stable.tokenizer.model_max_length,
-            truncation=True,
-            return_tensors="pt",
-        )
-        text_embeddings = ldm_stable.text_encoder(text_input.input_ids.to(ldm_stable.device))[0]
+        # 6. Fill masked regions by interpolating between border pixels
+        # Like "Fill - Naive interpolating": find the valid pixel on each side of
+        # each gap and linearly interpolate between them.
+        filled_right = warped_right.clone()  # [C, H, W]
+        mask_2d = inpaint_mask_px  # [H, W]
 
-        # 9. Denoising loop
-        controller = EmptyControl()
-        reshift_interval = max(1, len(active_timesteps) // 5)
+        # Scan left-to-right: track last valid pixel color and distance
+        has_left = torch.zeros(H, dtype=torch.bool, device=device)
+        left_val = torch.zeros(3, H, device=device)
+        left_dist = torch.zeros(H, W, device=device)
+        left_colors = torch.zeros(3, H, W, device=device)
 
-        for i, t in enumerate(tqdm(active_timesteps, desc="Fast stereo generation")):
-            if use_cfg:
-                # With CFG: build uncond + cond context
-                uncond_input = ldm_stable.tokenizer(
-                    [""] * batch_size, padding="max_length",
-                    max_length=ldm_stable.tokenizer.model_max_length, return_tensors="pt"
-                )
-                uncond_emb = ldm_stable.text_encoder(uncond_input.input_ids.to(ldm_stable.device))[0]
-                context = torch.cat([uncond_emb, text_embeddings])
-                latents = diffusion_step(
-                    ldm_stable, controller, latents, context, t,
-                    guidance_scale, low_resource=False
-                )
+        for col in range(W):
+            valid_here = ~mask_2d[:, col]  # [H]
+            # Update last valid from non-masked pixels
+            for c in range(3):
+                left_val[c] = torch.where(valid_here, warped_right[c, :, col], left_val[c])
+            has_left = has_left | valid_here
+            left_colors[:, :, col] = left_val
+            if col == 0:
+                left_dist[:, col] = torch.where(valid_here, torch.zeros(H, device=device),
+                                                torch.ones(H, device=device))
             else:
-                # No CFG: single UNet pass with cond embeddings only
-                latents = diffusion_step_no_cfg(
-                    ldm_stable, controller, latents, text_embeddings, t
-                )
+                left_dist[:, col] = torch.where(valid_here, torch.zeros(H, device=device),
+                                                left_dist[:, col - 1] + 1)
 
-            # Periodic re-application of stereo shift to maintain stereo effect
-            if i > 0 and i % reshift_interval == 0 and mask is not None:
-                z_reshift = stereo_shift_torch(
-                    latents[:1], disp_latent, scale_factor=scale_factor
-                )
-                latents[1:][mask] = z_reshift[1:][mask]
+        # Scan right-to-left
+        has_right = torch.zeros(H, dtype=torch.bool, device=device)
+        right_val = torch.zeros(3, H, device=device)
+        right_dist = torch.zeros(H, W, device=device)
+        right_colors = torch.zeros(3, H, W, device=device)
 
-        # 10. VAE decode
-        latents_scaled = 1 / 0.18215 * latents
-        decoded = ldm_stable.vae.decode(latents_scaled)['sample']
-        decoded = (decoded / 2 + 0.5).clamp(0, 1)
-        decoded = decoded.cpu().permute(0, 2, 3, 1).float().numpy()
-        decoded = np.nan_to_num(decoded, nan=0.0, posinf=1.0, neginf=0.0)
-        decoded = (decoded * 255).astype(np.uint8)
+        for col in range(W - 1, -1, -1):
+            valid_here = ~mask_2d[:, col]
+            for c in range(3):
+                right_val[c] = torch.where(valid_here, warped_right[c, :, col], right_val[c])
+            has_right = has_right | valid_here
+            right_colors[:, :, col] = right_val
+            if col == W - 1:
+                right_dist[:, col] = torch.where(valid_here, torch.zeros(H, device=device),
+                                                 torch.ones(H, device=device))
+            else:
+                right_dist[:, col] = torch.where(valid_here, torch.zeros(H, device=device),
+                                                 right_dist[:, col + 1] + 1)
 
-        # Restore original attention mechanism
-        restore_attention(ldm_stable)
+        # Compute interpolation weight
+        total_dist = left_dist + right_dist
+        total_dist = torch.clamp(total_dist, min=1.0)
+        t = left_dist / total_dist  # [H, W], 0=left border, 1=right border
 
-        # 11. Extract and resize
-        left_img = np.array(Image.fromarray(decoded[0]).resize(original_size))
-        right_img = np.array(Image.fromarray(decoded[1]).resize(original_size))
+        # Handle edge cases: if only one border exists, use it entirely
+        # has_left/has_right are per-row; expand to [H, W]
+        only_right = (~has_left).unsqueeze(1).expand_as(t)  # no left border found in this row
+        only_left = (~has_right).unsqueeze(1).expand_as(t)   # no right border found in this row
+        t = torch.where(only_right, torch.ones_like(t), t)
+        t = torch.where(only_left, torch.zeros_like(t), t)
+
+        # Apply interpolation only to masked pixels
+        for c in range(3):
+            interpolated = left_colors[c] * (1 - t) + right_colors[c] * t
+            filled_right[c] = torch.where(mask_2d, interpolated, warped_right[c])
+
+        # 7. Prepare PIL images for inpainting pipeline
+        # The inpainting model expects PIL Image inputs
+        warped_pil = Image.fromarray(
+            (filled_right.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+        )
+        # Mask: white = inpaint, black = keep (PIL convention for SD inpainting)
+        mask_np = (inpaint_mask_px.cpu().numpy() * 255).astype(np.uint8)
+        mask_pil = Image.fromarray(mask_np, mode='L')
+
+        # 8. Run inpainting pipeline
+        inpaint_prompt = prompt if prompt else "high quality, detailed"
+        print(f"Warp+Inpaint - Running inpainting with {num_steps} steps, "
+              f"strength={denoise_strength}, guidance={guidance_scale}")
+        print(f"Warp+Inpaint - Prompt: '{inpaint_prompt}'")
+
+        result = inpaint_pipe(
+            prompt=inpaint_prompt,
+            image=warped_pil,
+            mask_image=mask_pil,
+            num_inference_steps=num_steps,
+            guidance_scale=guidance_scale,
+            strength=denoise_strength,
+        )
+        inpainted_pil = result.images[0]
+        inpainted_np = np.array(inpainted_pil)
+
+        # 9. Pixel-space final blend: use original warped pixels for non-masked areas
+        # This avoids any VAE quality loss in regions that don't need inpainting.
+        warped_np = (warped_right.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+        mask_bool = inpaint_mask_px.cpu().numpy()  # [H, W]
+        mask_3ch = np.stack([mask_bool] * 3, axis=-1)  # [H, W, 3]
+        right_result = np.where(mask_3ch, inpainted_np, warped_np)
+
+        # 10. Left eye = original, right eye = warped + inpainted
+        left_img = np.array(Image.fromarray(img_resized).resize(original_size))
+        right_img = np.array(Image.fromarray(right_result).resize(original_size))
         stereo_pair = np.hstack([left_img, right_img])
 
-        stereo_tensor = numpy_to_tensor(stereo_pair)
-        left_tensor = numpy_to_tensor(left_img)
-        right_tensor = numpy_to_tensor(right_img)
-
-        return (stereo_tensor, left_tensor, right_tensor)
+        return (numpy_to_tensor(stereo_pair), numpy_to_tensor(left_img), numpy_to_tensor(right_img))
 
     @torch.no_grad()
     def _text2stereoimage(
