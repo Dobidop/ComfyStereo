@@ -55,7 +55,7 @@ class StereoImageNode:
                      'No fill', 'No fill - Reverse projection', 'Imperfect fill - Hybrid Edge', 'Fill - Naive',
                     'Fill - Naive interpolating', 'Fill - Polylines Soft', 'Fill - Polylines Sharp', 'GPU Warp (Fast)'#,
                     #'Fill - Post-fill', 'Fill - Reverse projection with Post-fill', 'Fill - Hybrid Edge with fill'
-                ], {"default": "Fill - Polylines Soft"}),
+                ], {"default": "GPU Warp (Fast)"}),
             },
             "optional": {
                 "divergence": ("FLOAT", {"default": 3.5, "min": 0.05, "max": 15, "step": 0.01}),
@@ -65,7 +65,7 @@ class StereoImageNode:
                 "stereo_offset_exponent": ("FLOAT", {"default": 2, "min": 0.1, "max": 2, "step": 0.11}),
                 "depth_map_blur": ("BOOLEAN", {"default": True}),
                 "depth_blur_edge_threshold": ("FLOAT", {"default": 6, "min": 0.1, "max": 15, "step": 0.1}),
-                "batch_size": ("INT", {"default": 512, "min": 1, "max": 512, "step": 1, "tooltip": "Number of frames to process before clearing GPU memory. Lower values use less memory but may be slower."}),
+                "batch_size": ("INT", {"default": 24, "min": 1, "max": 128, "step": 1, "tooltip": "Number of frames to process before clearing GPU memory. Lower values use less memory but may be slower."}),
             }
         }
     
@@ -98,192 +98,168 @@ class StereoImageNode:
 
         fill_technique = fill_technique_mapping.get(fill_technique, 'gpu_warp')
 
-        # Use chunked concatenation to avoid memory spikes at the end
-        # Instead of accumulating all frames then concatenating, we concatenate in chunks
         results_chunks = []
         depthmap_left_chunks = []
         depthmap_right_chunks = []
         mask_chunks = []
-
-        # Temporary lists for current chunk
-        results_batch = []
-        depthmap_left_batch = []
-        depthmap_right_batch = []
-        mask_batch = []
 
         total_steps = len(image)
         pbar = ProgressBar(total_steps)
 
         log_memory("Before processing loop")
 
-        # Process in batches to manage memory for large video sequences
-        frames_since_cleanup = 0
+        depth_blur_strength = divergence if depth_map_blur else 0
 
-        for i in range(len(image)):
-            if i % 10 == 0:  # Log every 10 frames to avoid too much output
-                log_memory(f"Frame {i}/{total_steps}")
-            # ComfyUI uses [H, W, C] format, convert to [C, H, W] for processing
-            img_tensor = image[i]  # [H, W, C]
-            dm_tensor = depth_map[i]  # [H, W, C]
+        # GPU batched path: process multiple frames per GPU call
+        if fill_technique == 'gpu_warp':
+            # Sub-batch size for GPU processing (how many frames per kernel launch)
+            gpu_batch_size = min(batch_size, total_steps)
 
-            # Convert from [H, W, C] to [C, H, W] format
-            if img_tensor.dim() == 3 and img_tensor.shape[2] in [1, 3]:
-                img_tensor = img_tensor.permute(2, 0, 1)  # [H, W, C] -> [C, H, W]
-            elif img_tensor.dim() == 2:
-                img_tensor = img_tensor.unsqueeze(0)  # [H, W] -> [1, H, W]
+            for batch_start in range(0, total_steps, gpu_batch_size):
+                batch_end = min(batch_start + gpu_batch_size, total_steps)
+                cur_batch_size = batch_end - batch_start
+                log_memory(f"GPU batch {batch_start}-{batch_end}")
 
-            if dm_tensor.dim() == 3 and dm_tensor.shape[2] in [1, 3]:
-                dm_tensor = dm_tensor.permute(2, 0, 1)  # [H, W, C] -> [C, H, W]
-            elif dm_tensor.dim() == 2:
-                dm_tensor = dm_tensor.unsqueeze(0)  # [H, W] -> [1, H, W]
+                # Slice sub-batch: ComfyUI format is [N, H, W, C]
+                img_batch = image[batch_start:batch_end]    # [B, H, W, C]
+                dm_batch = depth_map[batch_start:batch_end]  # [B, H, W, C]
 
-            # Convert RGB depth map to grayscale if needed (now in [C, H, W] format)
-            if dm_tensor.shape[0] == 3:
-                dm_tensor = 0.2989 * dm_tensor[0] + 0.5870 * dm_tensor[1] + 0.1140 * dm_tensor[2]
-            elif dm_tensor.shape[0] == 1:
-                dm_tensor = dm_tensor.squeeze(0)
+                # Convert [B, H, W, C] -> [B, C, H, W]
+                img_batch = img_batch.permute(0, 3, 1, 2)  # [B, C, H, W]
 
-            # Ensure dm_tensor is 2D at this point
-            if dm_tensor.dim() > 2:
-                dm_tensor = dm_tensor.squeeze()
+                # Convert depth to grayscale [B, H, W]
+                if dm_batch.shape[3] == 3:
+                    dm_batch = 0.2989 * dm_batch[:, :, :, 0] + 0.5870 * dm_batch[:, :, :, 1] + 0.1140 * dm_batch[:, :, :, 2]
+                elif dm_batch.shape[3] == 1:
+                    dm_batch = dm_batch.squeeze(3)
+                else:
+                    dm_batch = dm_batch[:, :, :, 0]
 
-            # Resize depth map if needed
-            if img_tensor.shape[1:] != dm_tensor.shape:
-                dm_tensor = torch.nn.functional.interpolate(
-                    dm_tensor.unsqueeze(0).unsqueeze(0),
-                    size=img_tensor.shape[1:],
-                    mode='bilinear',
-                    align_corners=False
-                ).squeeze()
+                # Resize depth if needed
+                if img_batch.shape[2:] != dm_batch.shape[1:]:
+                    dm_batch = torch.nn.functional.interpolate(
+                        dm_batch.unsqueeze(1),  # [B, 1, H, W]
+                        size=img_batch.shape[2:],
+                        mode='bilinear',
+                        align_corners=False
+                    ).squeeze(1)  # [B, H, W]
 
-            # Use divergence as depth_blur_strength for directional motion blur
-            depth_blur_strength = divergence if depth_map_blur else 0
-
-            # Use fully GPU-accelerated path for gpu_warp technique
-            if fill_technique == 'gpu_warp':
+                # Process entire sub-batch on GPU at once
                 results_tensors, left_depth, right_depth, disocclusion_mask = sig.create_stereoimages_gpu(
-                    img_tensor, dm_tensor, divergence, separation,
+                    img_batch, dm_batch, divergence, separation,
                     [modes], stereo_balance, stereo_offset_exponent, convergence_point,
                     depth_blur_strength, depth_blur_edge_threshold, depth_map_blur
                 )
-                # Convert GPU tensors to the expected format
-                # Results are [C, H, W] tensors, need to convert to PIL-compatible format
+
+                # Convert results [B, C, H, W] -> ComfyUI [B, H, W, C] on CPU
                 for result_tensor in results_tensors:
-                    # Convert from [C, H, W] to [H, W, C] and scale to 0-255
-                    result_np = result_tensor.permute(1, 2, 0).cpu().numpy()
-                    result_np = (np.clip(result_np, 0, 1) * 255).astype(np.uint8)
-                    results_batch.append(np2tensor(result_np))
+                    result_hwc = result_tensor.permute(0, 2, 3, 1).cpu()  # [B, H, W, C]
+                    results_chunks.append(result_hwc)
 
-                # Convert depth maps
-                left_depth_np = left_depth.cpu().numpy() if left_depth.is_cuda else left_depth.numpy()
-                right_depth_np = right_depth.cpu().numpy() if right_depth.is_cuda else right_depth.numpy()
-                left_depth_np = (np.clip(left_depth_np, 0, 1) * 255).astype(np.uint8)
-                right_depth_np = (np.clip(right_depth_np, 0, 1) * 255).astype(np.uint8)
+                # Convert depth maps [B, H, W] -> [B, H, W, 3] for ComfyUI
+                left_depth_cpu = left_depth.cpu().clamp(0, 1)
+                right_depth_cpu = right_depth.cpu().clamp(0, 1)
+                depthmap_left_chunks.append(left_depth_cpu.unsqueeze(-1).expand(-1, -1, -1, 3))
+                depthmap_right_chunks.append(right_depth_cpu.unsqueeze(-1).expand(-1, -1, -1, 3))
 
-                # Convert grayscale to RGB for consistency
-                if left_depth_np.ndim == 2:
-                    left_depth_np = np.stack([left_depth_np] * 3, axis=-1)
-                if right_depth_np.ndim == 2:
-                    right_depth_np = np.stack([right_depth_np] * 3, axis=-1)
+                # Mask [B, H, W] -> ComfyUI mask format
+                mask_chunks.append(disocclusion_mask.float().cpu())
 
-                depthmap_left_batch.append(np2tensor(left_depth_np))
-                depthmap_right_batch.append(np2tensor(right_depth_np))
+                pbar.update(cur_batch_size)
 
-                # Use disocclusion mask from GPU warp (True = disoccluded/filled pixel)
-                # Convert bool [H, W] to float [1, H, W] for ComfyUI mask format
-                mask = disocclusion_mask.float().unsqueeze(0).cpu()
+                # Memory cleanup between sub-batches
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+                log_memory(f"After GPU batch {batch_start}-{batch_end}")
+
+        else:
+            # CPU path for other fill techniques — still per-frame
+            results_batch = []
+            depthmap_left_batch = []
+            depthmap_right_batch = []
+            mask_batch = []
+            frames_since_cleanup = 0
+
+            for i in range(total_steps):
+                if i % 10 == 0:
+                    log_memory(f"Frame {i}/{total_steps}")
+
+                img_tensor = image[i]  # [H, W, C]
+                dm_tensor = depth_map[i]  # [H, W, C]
+
+                if img_tensor.dim() == 3 and img_tensor.shape[2] in [1, 3]:
+                    img_tensor = img_tensor.permute(2, 0, 1)
+                elif img_tensor.dim() == 2:
+                    img_tensor = img_tensor.unsqueeze(0)
+
+                if dm_tensor.dim() == 3 and dm_tensor.shape[2] in [1, 3]:
+                    dm_tensor = dm_tensor.permute(2, 0, 1)
+                elif dm_tensor.dim() == 2:
+                    dm_tensor = dm_tensor.unsqueeze(0)
+
+                if dm_tensor.shape[0] == 3:
+                    dm_tensor = 0.2989 * dm_tensor[0] + 0.5870 * dm_tensor[1] + 0.1140 * dm_tensor[2]
+                elif dm_tensor.shape[0] == 1:
+                    dm_tensor = dm_tensor.squeeze(0)
+
+                if dm_tensor.dim() > 2:
+                    dm_tensor = dm_tensor.squeeze()
+
+                if img_tensor.shape[1:] != dm_tensor.shape:
+                    dm_tensor = torch.nn.functional.interpolate(
+                        dm_tensor.unsqueeze(0).unsqueeze(0),
+                        size=img_tensor.shape[1:],
+                        mode='bilinear',
+                        align_corners=False
+                    ).squeeze()
+
+                output = sig.create_stereoimages(img_tensor, dm_tensor, divergence, separation,
+                                                 [modes], stereo_balance, stereo_offset_exponent,
+                                                 fill_technique, depth_blur_strength, depth_blur_edge_threshold,
+                                                 depth_map_blur, convergence_point=convergence_point)
+
+                if len(output) == 3:
+                    results, left_modified_depthmap, right_modified_depthmap = output
+                else:
+                    results, modified_depthmap = output
+                    left_modified_depthmap = modified_depthmap
+                    right_modified_depthmap = modified_depthmap
+
+                results_batch.append(convertResult(results))
+                depthmap_left_batch.append(convertResult(left_modified_depthmap))
+                depthmap_right_batch.append(convertResult(right_modified_depthmap))
+
+                mask = self.generate_mask(results)
                 mask_batch.append(mask)
 
-                # Memory management for large batches - concatenate and clear
                 frames_since_cleanup += 1
                 if frames_since_cleanup >= batch_size:
-                    log_memory(f"Before batch concat (frame {i})")
-                    # Concatenate current batch into a single tensor and store
+                    log_memory(f"CPU path: Before batch concat (frame {i})")
                     if results_batch:
                         results_chunks.append(torch.cat(results_batch, dim=0))
                         depthmap_left_chunks.append(torch.cat(depthmap_left_batch, dim=0))
                         depthmap_right_chunks.append(torch.cat(depthmap_right_batch, dim=0))
                         mask_chunks.append(torch.cat(mask_batch, dim=0))
-
-                        # Clear batch lists to free memory
                         results_batch = []
                         depthmap_left_batch = []
                         depthmap_right_batch = []
                         mask_batch = []
 
-                    log_memory(f"After batch concat, before cache clear (frame {i})")
-                    # Clear GPU cache to prevent memory buildup
+                    log_memory(f"CPU path: After batch concat (frame {i})")
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
-                    gc.collect()  # Also trigger Python garbage collection
-                    log_memory(f"After cache clear (frame {i})")
+                    gc.collect()
                     frames_since_cleanup = 0
 
                 pbar.update(1)
-                continue
 
-            # CPU path for other fill techniques
-            output = sig.create_stereoimages(img_tensor, dm_tensor, divergence, separation,
-                                             [modes], stereo_balance, stereo_offset_exponent,
-                                             fill_technique, depth_blur_strength, depth_blur_edge_threshold,
-                                             depth_map_blur, convergence_point=convergence_point)
-
-            
-            if len(output) == 3:
-                results, left_modified_depthmap, right_modified_depthmap = output
-            else:
-                results, modified_depthmap = output
-                left_modified_depthmap = modified_depthmap
-                right_modified_depthmap = modified_depthmap
-            
-            results_batch.append(convertResult(results))
-            depthmap_left_batch.append(convertResult(left_modified_depthmap))
-            depthmap_right_batch.append(convertResult(right_modified_depthmap))
-
-            mask = self.generate_mask(results)
-            mask_batch.append(mask)
-
-            # Memory management for large batches (CPU path) - concatenate and clear
-            frames_since_cleanup += 1
-            if frames_since_cleanup >= batch_size:
-                log_memory(f"CPU path: Before batch concat (frame {i})")
-                # Concatenate current batch into a single tensor and store
-                if results_batch:
-                    results_chunks.append(torch.cat(results_batch, dim=0))
-                    depthmap_left_chunks.append(torch.cat(depthmap_left_batch, dim=0))
-                    depthmap_right_chunks.append(torch.cat(depthmap_right_batch, dim=0))
-                    mask_chunks.append(torch.cat(mask_batch, dim=0))
-
-                    # Clear batch lists to free memory
-                    results_batch = []
-                    depthmap_left_batch = []
-                    depthmap_right_batch = []
-                    mask_batch = []
-
-                log_memory(f"CPU path: After batch concat (frame {i})")
-                # Clear GPU cache if available (may have been used for depth map operations)
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                gc.collect()
-                log_memory(f"CPU path: After cache clear (frame {i})")
-                frames_since_cleanup = 0
-
-            pbar.update(1)
-
-        # Handle any remaining frames in the last incomplete batch
-        log_memory("After processing loop, before final batch handling")
-        if results_batch:
-            log_memory(f"Final batch: {len(results_batch)} remaining frames")
-            results_chunks.append(torch.cat(results_batch, dim=0))
-            depthmap_left_chunks.append(torch.cat(depthmap_left_batch, dim=0))
-            depthmap_right_chunks.append(torch.cat(depthmap_right_batch, dim=0))
-            mask_chunks.append(torch.cat(mask_batch, dim=0))
-            # Clear to free memory before final concat
-            results_batch = []
-            depthmap_left_batch = []
-            depthmap_right_batch = []
-            mask_batch = []
-            gc.collect()
+            # Flush remaining CPU frames
+            if results_batch:
+                results_chunks.append(torch.cat(results_batch, dim=0))
+                depthmap_left_chunks.append(torch.cat(depthmap_left_batch, dim=0))
+                depthmap_right_chunks.append(torch.cat(depthmap_right_batch, dim=0))
+                mask_chunks.append(torch.cat(mask_batch, dim=0))
 
         log_memory(f"Before final concat: {len(results_chunks)} chunks")
         if DEBUG_MEMORY:

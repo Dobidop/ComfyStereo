@@ -35,107 +35,82 @@ def apply_stereo_divergence_gpu(image_tensor, depth_tensor, divergence_px, separ
                                  stereo_offset_exponent, convergence_point=0.5):
     """
     GPU-accelerated stereo divergence using PyTorch grid_sample.
-
-    This function warps the image based on the depth map to create stereo views.
-    It runs entirely on GPU, avoiding CPU-GPU memory transfers.
+    Supports batched inputs for processing multiple frames simultaneously.
 
     Parameters:
-        image_tensor (torch.Tensor): Input image [C, H, W] or [H, W, C], values 0-1
-        depth_tensor (torch.Tensor): Depth map [H, W], values 0-1 (or 0-255, will be normalized)
-        divergence_px (float): Divergence in pixels (positive = shift right, negative = shift left)
+        image_tensor (torch.Tensor): Input image [B, C, H, W], values 0-1
+        depth_tensor (torch.Tensor): Depth map [B, H, W], values 0-1 (or 0-255, will be normalized)
+        divergence_px (float): Divergence in pixels
         separation_px (float): Additional separation in pixels
         stereo_offset_exponent (float): Exponent for depth-to-offset mapping
         convergence_point (float): Which depth appears at screen plane (0.0-1.0)
 
     Returns:
-        torch.Tensor: Warped image [C, H, W], values 0-1
+        torch.Tensor: Warped image [B, C, H, W], values 0-1
     """
     device = _get_device(depth_tensor, image_tensor)
     image_tensor = image_tensor.to(device)
     depth_tensor = depth_tensor.to(device)
 
-    # Handle image format - ensure [C, H, W]
-    if image_tensor.dim() == 3:
-        if image_tensor.shape[2] in [1, 3, 4]:  # [H, W, C] format
-            image_tensor = image_tensor.permute(2, 0, 1)
+    B, _, H, W = image_tensor.shape
 
-    C, H, W = image_tensor.shape
-
-    # Ensure depth is 2D [H, W]
-    if depth_tensor.dim() == 3:
-        depth_tensor = depth_tensor.squeeze()
-    if depth_tensor.dim() == 1:
-        depth_tensor = depth_tensor.view(H, W)
-
-    # Normalize depth to 0-1 range if needed
-    depth_min = depth_tensor.min()
-    depth_max = depth_tensor.max()
-    if depth_max > 1.0:
+    # Normalize depth to 0-1 range if needed (per-image)
+    depth_min = depth_tensor.amin(dim=(1, 2), keepdim=True)
+    depth_max = depth_tensor.amax(dim=(1, 2), keepdim=True)
+    needs_rescale = (depth_max > 1.0).any()
+    if needs_rescale:
         depth_tensor = depth_tensor / 255.0
-        depth_min = depth_tensor.min()
-        depth_max = depth_tensor.max()
+        depth_min = depth_tensor.amin(dim=(1, 2), keepdim=True)
+        depth_max = depth_tensor.amax(dim=(1, 2), keepdim=True)
 
-    # Normalize depth map to 0-1 range
-    if depth_max - depth_min > 1e-6:
-        normalized_depth = (depth_tensor - depth_min) / (depth_max - depth_min)
-    else:
-        normalized_depth = torch.zeros_like(depth_tensor)
+    # Normalize depth map to 0-1 range per image
+    depth_range = depth_max - depth_min
+    normalized_depth = torch.where(
+        depth_range > 1e-6,
+        (depth_tensor - depth_min) / depth_range.clamp(min=1e-6),
+        torch.zeros_like(depth_tensor)
+    )
 
-    # Apply convergence point offset
+    # Apply convergence point offset and exponent
     normalized_depth = normalized_depth - convergence_point
-
-    # Apply stereo offset exponent
-    # Handle negative values from convergence point shift
     sign = torch.sign(normalized_depth)
     abs_depth = torch.abs(normalized_depth)
     offset_depth = sign * torch.pow(abs_depth, stereo_offset_exponent)
 
-    # Calculate pixel offsets
+    # Calculate pixel offsets [B, H, W]
     pixel_offset = offset_depth * divergence_px + separation_px
-
-    # Convert pixel offset to normalized coordinates (-1 to 1)
-    # grid_sample uses normalized coords where -1 is left edge, +1 is right edge
     offset_normalized = pixel_offset / (W / 2)
 
-    # Create sampling grid
-    # Base grid: regular pixel coordinates normalized to [-1, 1]
+    # Create sampling grid [B, H, W, 2]
     y_coords = torch.linspace(-1, 1, H, device=device)
     x_coords = torch.linspace(-1, 1, W, device=device)
     grid_y, grid_x = torch.meshgrid(y_coords, x_coords, indexing='ij')
+    # Expand to batch: [B, H, W]
+    grid_x = grid_x.unsqueeze(0).expand(B, -1, -1)
+    grid_y = grid_y.unsqueeze(0).expand(B, -1, -1)
 
-    # Apply horizontal offset to x coordinates
-    # We sample FROM the offset position, so we subtract the offset
     grid_x_warped = grid_x - offset_normalized
+    grid = torch.stack([grid_x_warped, grid_y], dim=-1)  # [B, H, W, 2]
 
-    # Stack into grid format [1, H, W, 2]
-    grid = torch.stack([grid_x_warped, grid_y], dim=-1).unsqueeze(0)
-
-    # Add batch dimension to image [1, C, H, W]
-    image_batch = image_tensor.unsqueeze(0)
-
-    # Perform the warp using grid_sample
-    # padding_mode='border' repeats edge pixels for out-of-bounds samples
-    # This provides automatic "fill" for gaps
+    # grid_sample: [B, C, H, W] x [B, H, W, 2] -> [B, C, H, W]
     warped = F.grid_sample(
-        image_batch,
-        grid,
-        mode='bilinear',
-        padding_mode='border',
-        align_corners=True
+        image_tensor, grid,
+        mode='bilinear', padding_mode='border', align_corners=True
     )
 
-    # Remove batch dimension and return [C, H, W]
-    return warped.squeeze(0)
+    return warped
 
 
 def _normalize_depth_01(depth_tensor, convergence_point=0.5):
-    """Normalize depth to 0-1 range with convergence point offset."""
+    """Normalize depth to 0-1 range. Supports [H,W] or [B,H,W]."""
     d = depth_tensor.clone()
-    d_min, d_max = d.min(), d.max()
-    if d_max - d_min > 1e-6:
-        d = (d - d_min) / (d_max - d_min)
-    else:
-        d = torch.zeros_like(d)
+    if d.dim() == 3:  # [B, H, W]
+        d_min = d.amin(dim=(1, 2), keepdim=True)
+        d_max = d.amax(dim=(1, 2), keepdim=True)
+    else:  # [H, W]
+        d_min, d_max = d.min(), d.max()
+    d_range = d_max - d_min
+    d = torch.where(d_range > 1e-6, (d - d_min) / d_range.clamp(min=1e-6), torch.zeros_like(d))
     return d
 
 
@@ -143,13 +118,10 @@ def compute_forward_mask_gpu(depth_tensor, divergence_px, separation_px,
                              stereo_offset_exponent, convergence_point, device):
     """
     Compute pixel-precise gap mask using forward-mapping math, fully vectorized.
-
-    Instead of actually moving pixels (which requires slow per-column loops),
-    we just compute WHERE each source pixel would land via scatter_add_.
-    Destinations with zero hits are gaps. Single GPU kernel, no Python loops.
+    Supports batched inputs [B, H, W].
 
     Args:
-        depth_tensor: [H, W] depth map (0-255 or 0-1)
+        depth_tensor: [B, H, W] depth map (0-255 or 0-1)
         divergence_px: Horizontal shift in pixels
         separation_px: Additional separation in pixels
         stereo_offset_exponent: Power curve for depth-to-offset
@@ -157,40 +129,55 @@ def compute_forward_mask_gpu(depth_tensor, divergence_px, separation_px,
         device: torch device
 
     Returns:
-        gap_mask: [H, W] bool tensor, True = gap (no source pixel lands here)
+        gap_mask: [B, H, W] bool tensor, True = gap (no source pixel lands here)
     """
-    H, W = depth_tensor.shape
+    B, H, W = depth_tensor.shape
 
-    # Normalize depth to 0-1
+    # Normalize depth to 0-1 per image
     d = depth_tensor.clone()
-    if d.max() > 1.0:
+    d_max_all = d.amax(dim=(1, 2), keepdim=True)
+    if (d_max_all > 1.0).any():
         d = d / 255.0
-    d_min, d_max = d.min(), d.max()
-    if d_max - d_min > 1e-6:
-        normalized_depth = (d - d_min) / (d_max - d_min)
-    else:
-        normalized_depth = torch.zeros_like(d)
+    d_min = d.amin(dim=(1, 2), keepdim=True)
+    d_max = d.amax(dim=(1, 2), keepdim=True)
+    d_range = d_max - d_min
+    normalized_depth = torch.where(
+        d_range > 1e-6,
+        (d - d_min) / d_range.clamp(min=1e-6),
+        torch.zeros_like(d)
+    )
 
-    # Apply convergence and exponent (same formula as all warp functions)
+    # Apply convergence and exponent
     depth_shifted = normalized_depth - convergence_point
     sign = torch.sign(depth_shifted)
     abs_depth = torch.abs(depth_shifted)
     offset_depth = sign * torch.pow(abs_depth, stereo_offset_exponent)
 
-    # Compute destination column for each source pixel [H, W]
+    # Compute destination column for each source pixel [B, H, W]
     pixel_offset = offset_depth * divergence_px + separation_px
-    col_indices = torch.arange(W, device=device, dtype=torch.float32).unsqueeze(0).expand(H, W)
+    col_indices = torch.arange(W, device=device, dtype=torch.float32).unsqueeze(0).unsqueeze(0).expand(B, H, W)
     dest_cols = (col_indices + pixel_offset).long()
 
     # Mark which destinations receive at least one source pixel
     valid = (dest_cols >= 0) & (dest_cols < W)
     dest_clamped = dest_cols.clamp(0, W - 1)
 
-    # scatter_add_ accumulates: dest positions with >0 valid sources get count > 0
-    hit_count = torch.zeros(H, W, device=device)
-    hit_count.scatter_add_(1, dest_clamped, valid.float())
+    # scatter_add_ along W dimension (dim=2 for [B, H, W])
+    hit_count = torch.zeros(B, H, W, device=device)
+    hit_count.scatter_add_(2, dest_clamped, valid.float())
 
     gap_mask = hit_count < 0.5  # True = no source pixel lands here
+
+    # Dilate gap mask by 1px at depth edges to cover bilinear-blended ghost pixels
+    offset_grad = torch.abs(pixel_offset[:, :, 1:] - pixel_offset[:, :, :-1])  # [B, H, W-1]
+    depth_edge = torch.zeros(B, H, W, dtype=torch.bool, device=device)
+    depth_edge[:, :, :-1] = offset_grad > 1.5
+    depth_edge[:, :, 1:] = depth_edge[:, :, 1:] | (offset_grad > 1.5)
+
+    dilated = gap_mask.clone()
+    dilated[:, :, 1:] = dilated[:, :, 1:] | (gap_mask[:, :, :-1] & depth_edge[:, :, 1:])
+    dilated[:, :, :-1] = dilated[:, :, :-1] | (gap_mask[:, :, 1:] & depth_edge[:, :, :-1])
+    gap_mask = dilated
 
     return gap_mask
 
@@ -298,52 +285,47 @@ def detect_disocclusions_gpu(depth_tensor, grid, grid_x_warped, device, threshol
 def interpolate_fill_gpu(image_tensor, mask, device, depth_tensor=None):
     """
     Fill masked regions biased toward the background side. Fully vectorized.
-
-    Uses cummax + gather to find nearest valid pixels on each side in O(1)
-    GPU operations (no Python loops). Then interpolates with background bias.
+    Supports batched inputs [B, C, H, W].
 
     Args:
-        image_tensor: [C, H, W] image tensor
-        mask: [H, W] bool tensor, True = needs filling
+        image_tensor: [B, C, H, W] image tensor
+        mask: [B, H, W] bool tensor, True = needs filling
         device: torch device
-        depth_tensor: [H, W] normalized depth (optional, for fg/bg detection)
+        depth_tensor: [B, H, W] normalized depth (optional, for fg/bg detection)
 
     Returns:
-        filled: [C, H, W] tensor with gaps filled
+        filled: [B, C, H, W] tensor with gaps filled
     """
-    C, H, W = image_tensor.shape
-    valid = ~mask  # True where pixel has real data
+    B, C, H, W = image_tensor.shape
+    valid = ~mask  # [B, H, W] True where pixel has real data
 
-    # Column indices [H, W]
-    cols = torch.arange(W, device=device).unsqueeze(0).expand(H, W)
+    # Column indices [B, H, W]
+    cols = torch.arange(W, device=device).unsqueeze(0).unsqueeze(0).expand(B, H, W)
 
     # --- Left-to-right: find nearest valid pixel to the left ---
-    # For valid positions store column index, for invalid store -1
     left_valid_col = torch.where(valid, cols, torch.full_like(cols, -1))
-    # cummax propagates the last valid column index forward
-    left_nearest_col, _ = torch.cummax(left_valid_col, dim=1)
+    left_nearest_col, _ = torch.cummax(left_valid_col, dim=2)  # along W
     left_dist = (cols - left_nearest_col).float()
     has_left = left_nearest_col >= 0
 
     # --- Right-to-left: find nearest valid pixel to the right ---
-    # Flip, cummax, flip back. Use column indices so larger = more rightward
     right_valid_col_flip = torch.where(
-        torch.flip(valid, [1]),
-        torch.flip(cols, [1]),
+        torch.flip(valid, [2]),
+        torch.flip(cols, [2]),
         torch.full_like(cols, -1)
     )
-    right_nearest_flip, _ = torch.cummax(right_valid_col_flip, dim=1)
-    right_nearest_col = torch.flip(right_nearest_flip, [1])
+    right_nearest_flip, _ = torch.cummax(right_valid_col_flip, dim=2)
+    right_nearest_col = torch.flip(right_nearest_flip, [2])
     right_dist = (right_nearest_col - cols).float()
     has_right = right_nearest_col >= 0
 
-    # Gather colors at nearest valid positions
-    left_idx = left_nearest_col.clamp(0, W - 1).unsqueeze(0).expand(C, H, W)
-    right_idx = right_nearest_col.clamp(0, W - 1).unsqueeze(0).expand(C, H, W)
-    left_colors = image_tensor.gather(2, left_idx)
-    right_colors = image_tensor.gather(2, right_idx)
+    # Gather colors at nearest valid positions [B, C, H, W]
+    left_idx = left_nearest_col.clamp(0, W - 1).unsqueeze(1).expand(B, C, H, W)
+    right_idx = right_nearest_col.clamp(0, W - 1).unsqueeze(1).expand(B, C, H, W)
+    left_colors = image_tensor.gather(3, left_idx)   # gather along W dim
+    right_colors = image_tensor.gather(3, right_idx)
 
-    # Interpolation weight: 0 = left border, 1 = right border
+    # Interpolation weight [B, H, W]: 0 = left border, 1 = right border
     total_dist = torch.clamp(left_dist + right_dist, min=1.0)
     t = left_dist / total_dist
 
@@ -355,30 +337,27 @@ def interpolate_fill_gpu(image_tensor, mask, device, depth_tensor=None):
     if depth_tensor is not None:
         left_depth_idx = left_nearest_col.clamp(0, W - 1)
         right_depth_idx = right_nearest_col.clamp(0, W - 1)
-        left_depth_at_border = depth_tensor.gather(1, left_depth_idx)
-        right_depth_at_border = depth_tensor.gather(1, right_depth_idx)
+        left_depth_at_border = depth_tensor.gather(2, left_depth_idx)   # gather along W
+        right_depth_at_border = depth_tensor.gather(2, right_depth_idx)
 
-        # left_is_fg: True where left border is foreground (higher depth)
         left_is_fg = left_depth_at_border > right_depth_at_border
-        # Power curve biases away from foreground
         t_biased = torch.where(left_is_fg, t.pow(1.5), 1.0 - (1.0 - t).pow(1.5))
         t = torch.where(mask, t_biased, t)
 
-    # Expand t for broadcasting with [C, H, W]
-    t_expanded = t.unsqueeze(0)
+    # Expand t for broadcasting with [B, C, H, W]
+    t_expanded = t.unsqueeze(1)
     interpolated = left_colors * (1.0 - t_expanded) + right_colors * t_expanded
-    filled = torch.where(mask.unsqueeze(0), interpolated, image_tensor)
+    filled = torch.where(mask.unsqueeze(1), interpolated, image_tensor)
 
     # Vertical smoothing on filled regions to reduce horizontal streak artifacts
     if mask.any():
         v_kernel = torch.tensor([0.25, 0.5, 0.25], device=device, dtype=filled.dtype)
         v_kernel = v_kernel.view(1, 1, 3, 1)
-        filled_4d = filled.unsqueeze(0)
-        # Apply same kernel to all channels using groups
-        v_kernel_c = v_kernel.expand(C, 1, 3, 1)
-        blurred = F.conv2d(filled_4d, v_kernel_c, padding=(1, 0), groups=C)
-        blurred = blurred.squeeze(0)
-        filled = torch.where(mask.unsqueeze(0), blurred, filled)
+        # Reshape to [B*C, 1, H, W] for grouped conv, then back to [B, C, H, W]
+        filled_bc = filled.view(B * C, 1, H, W)
+        blurred_bc = F.conv2d(filled_bc, v_kernel, padding=(1, 0))
+        blurred = blurred_bc.view(B, C, H, W)
+        filled = torch.where(mask.unsqueeze(1), blurred, filled)
 
     return filled
 
@@ -470,14 +449,13 @@ def create_stereoimages_gpu(image_tensor, depth_tensor, divergence, separation=0
                             depth_blur_strength=0.0, depth_blur_edge_threshold=6.0,
                             direction_aware_depth_blur=False):
     """
-    Fully GPU-accelerated stereo image generation.
+    Fully GPU-accelerated stereo image generation with batch support.
 
-    This function keeps all processing on the GPU, avoiding expensive CPU-GPU transfers.
-    Uses grid_sample for fast hardware-accelerated image warping.
+    Processes multiple frames simultaneously on the GPU for higher utilization.
 
     Parameters:
-        image_tensor (torch.Tensor): Input image [C, H, W] or [H, W, C], values 0-1
-        depth_tensor (torch.Tensor): Depth map [H, W] or [C, H, W], values 0-1
+        image_tensor (torch.Tensor): Input image [B, C, H, W], values 0-1
+        depth_tensor (torch.Tensor): Depth map [B, H, W], values 0-1
         divergence (float): 3D effect strength in percentages
         separation (float): Additional horizontal shift percentage
         modes (list): Output modes ('left-right', 'top-bottom', etc.)
@@ -489,38 +467,27 @@ def create_stereoimages_gpu(image_tensor, depth_tensor, divergence, separation=0
         direction_aware_depth_blur (bool): Use directional blur for left/right eyes
 
     Returns:
-        tuple: (list of stereo images as tensors, left_depth, right_depth)
+        tuple: (list of stereo images [B,C,H,W], left_depth [B,H,W], right_depth [B,H,W], mask [B,H,W])
     """
     if modes is None:
         modes = ['left-right']
     if not isinstance(modes, list):
         modes = [modes]
     if len(modes) == 0:
-        return [], None, None
+        return [], None, None, None
 
     device = _get_device(depth_tensor, image_tensor)
     image_tensor = image_tensor.to(device)
     depth_tensor = depth_tensor.to(device)
 
-    # Ensure image is [C, H, W]
-    if image_tensor.dim() == 3:
-        if image_tensor.shape[2] in [1, 3, 4]:
-            image_tensor = image_tensor.permute(2, 0, 1)
-
-    C, H, W = image_tensor.shape
-
-    # Ensure depth is [H, W]
-    if depth_tensor.dim() == 3:
-        if depth_tensor.shape[0] == 3:  # RGB depth map
-            depth_tensor = 0.2989 * depth_tensor[0] + 0.5870 * depth_tensor[1] + 0.1140 * depth_tensor[2]
-        else:
-            depth_tensor = depth_tensor.squeeze()
+    B, _, H, W = image_tensor.shape
 
     # Normalize depth to 0-255 range for blur function compatibility
-    if depth_tensor.max() <= 1.0:
+    if depth_tensor.amax() <= 1.0:
         depth_tensor = depth_tensor * 255.0
 
     # Apply directional depth blur if enabled
+    # directional_motion_blur_gpu handles [B, H, W] via its internal 4D reshape
     if direction_aware_depth_blur and depth_blur_strength > 0:
         left_depth, right_depth = directional_motion_blur_gpu(
             depth_tensor, depth_blur_strength, depth_blur_edge_threshold, depth_blur_strength
@@ -529,36 +496,30 @@ def create_stereoimages_gpu(image_tensor, depth_tensor, divergence, separation=0
         left_depth = depth_tensor
         right_depth = depth_tensor
 
-    # Calculate divergence in pixels
-    divergence_px = (divergence / 100.0) * W
-    separation_px = (separation / 100.0) * W
-
     # Calculate balanced divergence for each eye
     left_divergence = divergence * (1 + stereo_balance)
     right_divergence = divergence * (1 - stereo_balance)
 
     left_divergence_px = (left_divergence / 100.0) * W
     right_divergence_px = (right_divergence / 100.0) * W
+    separation_px = (separation / 100.0) * W
 
     # Hybrid approach: grid_sample for fast pixel warping + forward-mapping mask
-    # for pixel-precise gap detection. Best of both worlds: GPU speed + quality.
-    left_mask = torch.zeros(H, W, dtype=torch.bool, device=device)
-    right_mask = torch.zeros(H, W, dtype=torch.bool, device=device)
+    left_mask = torch.zeros(B, H, W, dtype=torch.bool, device=device)
+    right_mask = torch.zeros(B, H, W, dtype=torch.bool, device=device)
 
     if left_divergence < 0.001:
         left_eye = image_tensor
     else:
-        # Fast inverse warp for pixel values (single grid_sample call)
         left_eye = apply_stereo_divergence_gpu(
             image_tensor, left_depth, +left_divergence_px, -separation_px,
             stereo_offset_exponent, convergence_point)
-        # Pixel-precise gap mask from forward mapping math (single scatter call)
         left_mask = compute_forward_mask_gpu(
             left_depth, +left_divergence_px, -separation_px,
             stereo_offset_exponent, convergence_point, device)
         if left_mask.any():
             left_depth_norm = _normalize_depth_01(
-                left_depth / 255.0 if left_depth.max() > 1.0 else left_depth)
+                left_depth / 255.0 if left_depth.amax() > 1.0 else left_depth)
             left_eye = interpolate_fill_gpu(left_eye, left_mask, device, depth_tensor=left_depth_norm)
 
     if right_divergence < 0.001:
@@ -572,48 +533,46 @@ def create_stereoimages_gpu(image_tensor, depth_tensor, divergence, separation=0
             stereo_offset_exponent, convergence_point, device)
         if right_mask.any():
             right_depth_norm = _normalize_depth_01(
-                right_depth / 255.0 if right_depth.max() > 1.0 else right_depth)
+                right_depth / 255.0 if right_depth.amax() > 1.0 else right_depth)
             right_eye = interpolate_fill_gpu(right_eye, right_mask, device, depth_tensor=right_depth_norm)
 
-    # Combined gap mask (both eyes)
     combined_mask = left_mask | right_mask
 
-    # Generate output modes
+    # Generate output modes — all dims shift for batch: width=3, height=2
     results = []
     for mode in modes:
         if mode == 'left-right':
-            result = torch.cat([left_eye, right_eye], dim=2)  # Horizontal concat on width
+            result = torch.cat([left_eye, right_eye], dim=3)
         elif mode == 'right-left':
-            result = torch.cat([right_eye, left_eye], dim=2)
+            result = torch.cat([right_eye, left_eye], dim=3)
         elif mode == 'top-bottom':
-            result = torch.cat([left_eye, right_eye], dim=1)  # Vertical concat on height
+            result = torch.cat([left_eye, right_eye], dim=2)
         elif mode == 'bottom-top':
-            result = torch.cat([right_eye, left_eye], dim=1)
+            result = torch.cat([right_eye, left_eye], dim=2)
         elif mode == 'red-cyan-anaglyph':
-            # Red channel from left, green+blue from right
             result = torch.stack([
-                left_eye[0],   # Red from left
-                right_eye[1],  # Green from right
-                right_eye[2]   # Blue from right
-            ], dim=0)
+                left_eye[:, 0],    # Red from left [B, H, W]
+                right_eye[:, 1],   # Green from right
+                right_eye[:, 2]    # Blue from right
+            ], dim=1)  # -> [B, 3, H, W]
         elif mode == 'left-only':
             result = left_eye
         elif mode == 'only-right':
             result = right_eye
         elif mode == 'cyan-red-reverseanaglyph':
             result = torch.stack([
-                right_eye[0],
-                left_eye[1],
-                left_eye[2]
-            ], dim=0)
+                right_eye[:, 0],
+                left_eye[:, 1],
+                left_eye[:, 2]
+            ], dim=1)
         else:
             raise ValueError(f'Unknown mode: {mode}')
 
         results.append(result)
 
     # Normalize depth maps for output (0-1 range)
-    left_depth_out = left_depth / 255.0 if left_depth.max() > 1.0 else left_depth
-    right_depth_out = right_depth / 255.0 if right_depth.max() > 1.0 else right_depth
+    left_depth_out = left_depth / 255.0 if left_depth.amax() > 1.0 else left_depth
+    right_depth_out = right_depth / 255.0 if right_depth.amax() > 1.0 else right_depth
 
     return results, left_depth_out, right_depth_out, combined_mask
 
@@ -638,11 +597,14 @@ def directional_motion_blur_gpu(depth_tensor, blur_strength, edge_threshold, blu
     device = _get_device(depth_tensor)
     depth_tensor = depth_tensor.to(device)
 
-    # Ensure 4D tensor [B, C, H, W]
+    # Track original dims to restore on output
+    input_ndim = depth_tensor.dim()
+
+    # Ensure 4D tensor [B, 1, H, W]
     if depth_tensor.dim() == 2:
-        depth_tensor = depth_tensor.unsqueeze(0).unsqueeze(0)
+        depth_tensor = depth_tensor.unsqueeze(0).unsqueeze(0)  # [H,W] -> [1,1,H,W]
     elif depth_tensor.dim() == 3:
-        depth_tensor = depth_tensor.unsqueeze(0)
+        depth_tensor = depth_tensor.unsqueeze(1)  # [B,H,W] -> [B,1,H,W]
 
     blur_strength = int(round(blur_strength))
 
@@ -696,8 +658,13 @@ def directional_motion_blur_gpu(depth_tensor, blur_strength, edge_threshold, blu
     left_blurred = torch.where(left_dilated_mask, blurred_depth_left, left_blurred)
     right_blurred = torch.where(right_dilated_mask, blurred_depth_right, right_blurred)
 
-    # Return in original shape
-    return left_blurred.squeeze(), right_blurred.squeeze()
+    # Restore original shape: [H,W] if input was 2D, [B,H,W] if input was 3D
+    left_out = left_blurred.squeeze(1)   # remove channel dim -> [B, H, W]
+    right_out = right_blurred.squeeze(1)
+    if input_ndim == 2:
+        left_out = left_out.squeeze(0)   # remove batch dim -> [H, W]
+        right_out = right_out.squeeze(0)
+    return left_out, right_out
 
 def blur_depth_map(depth, sigma):
     """

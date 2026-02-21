@@ -100,23 +100,11 @@ The main node for depth-based stereo conversion.
 - `blurred_depthmap_right` (IMAGE) - Processed right depth map
 - `no_fill_imperfect_mask` (MASK) - Unfilled region mask
 
-#### 2. DeoVR View Node
-Launch and view stereo content in DeoVR.
-
-**Inputs:**
-- `file_name` (STRING) - File or video path
-- `projection_type` - Display mode (Flat, 180°, 360°, Fisheye variants)
-- `eye_location` - Side-by-Side or Top-Bottom
-- `file_location` - Output folder, Input folder, or Other
-
-**Setup Required:**
-Edit `config.json` to set your DeoVR.exe path. Enable "Remote control" in DeoVR developer settings.
-
 ### Native VR Viewer Nodes
 
 Requires `pip install -r requirements-native.txt` and a VR runtime (SteamVR, Oculus, or WMR).
 
-#### 3. Native Stereo Image Viewer
+#### 2. Native Stereo Image Viewer
 Auto-launches images directly into VR headset.
 
 **Inputs:**
@@ -133,7 +121,7 @@ Auto-launches images directly into VR headset.
 **Outputs:**
 - `passthrough` (IMAGE) - Original image
 
-#### 4. Native Stereo Video Viewer
+#### 3. Native Stereo Video Viewer
 Play stereo videos in VR with keyboard controls.
 
 **Inputs:**
@@ -147,7 +135,7 @@ Play stereo videos in VR with keyboard controls.
 - `auto_launch` (BOOLEAN)
 - `background_color`
 
-#### 5. Native VR Status
+#### 4. Native VR Status
 Check PyOpenXR installation and VR runtime availability.
 
 **Outputs:**
@@ -158,7 +146,7 @@ Check PyOpenXR installation and VR runtime availability.
 
 Requires `pip install -r requirements-diffusion.txt` and 8GB+ VRAM.
 
-#### 6. StereoDiffusion Node
+#### 5. StereoDiffusion Node
 AI-powered stereo generation using diffusion models.
 
 **Inputs:**
