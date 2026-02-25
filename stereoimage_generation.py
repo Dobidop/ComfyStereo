@@ -16,6 +16,24 @@ import torch.nn.functional as F
 # GPU availability check
 CUDA_AVAILABLE = torch.cuda.is_available()
 
+# ModernGL for mesh-based GPU rasterization via OpenGL
+try:
+    import moderngl
+    MODERNGL_AVAILABLE = True
+except ImportError:
+    MODERNGL_AVAILABLE = False
+    moderngl = None
+
+# Cached ModernGL context (singleton)
+_moderngl_ctx = None
+
+def _get_moderngl_context():
+    """Get or create a cached ModernGL standalone context."""
+    global _moderngl_ctx
+    if _moderngl_ctx is None:
+        _moderngl_ctx = moderngl.create_standalone_context()
+    return _moderngl_ctx
+
 
 def _get_device(*tensors):
     """Get the best available device, with CUDA fallback to CPU on error."""
@@ -101,17 +119,580 @@ def apply_stereo_divergence_gpu(image_tensor, depth_tensor, divergence_px, separ
     return warped
 
 
-def _normalize_depth_01(depth_tensor, convergence_point=0.5):
-    """Normalize depth to 0-1 range. Supports [H,W] or [B,H,W]."""
+def warp_and_fill_gpu(image_tensor, depth_tensor, divergence_px, separation_px,
+                      stereo_offset_exponent, convergence_point=0.5):
+    """
+    GPU stereo warp with built-in edge-stretching fill.
+
+    Instead of warping and then post-filling gaps, this modifies the warp grid
+    at gap positions to smoothly interpolate between border source positions.
+    The result is a natural "edge stretching" effect: the foreground edge pixels
+    are stretched across the disocclusion gap via grid_sample on the original image.
+
+    This avoids all bilinear smearing artifacts because gap pixels sample from
+    interpolated source positions in the original (pre-warp) image, not from
+    the warped image.
+
+    Args:
+        image_tensor: [B, C, H, W] input image, values 0-1
+        depth_tensor: [B, H, W] depth map (0-255 or 0-1)
+        divergence_px: horizontal shift in pixels
+        separation_px: additional separation in pixels
+        stereo_offset_exponent: power curve for depth mapping
+        convergence_point: which depth maps to zero offset
+
+    Returns:
+        warped: [B, C, H, W] warped image with gaps filled via edge stretching
+        gap_mask: [B, H, W] bool tensor marking gap/dilated locations
+    """
+    device = _get_device(depth_tensor, image_tensor)
+    image_tensor = image_tensor.to(device)
+    depth_tensor = depth_tensor.to(device)
+
+    B, _, H, W = image_tensor.shape
+
+    # --- Compute pixel offset from depth ---
     d = depth_tensor.clone()
-    if d.dim() == 3:  # [B, H, W]
-        d_min = d.amin(dim=(1, 2), keepdim=True)
-        d_max = d.amax(dim=(1, 2), keepdim=True)
-    else:  # [H, W]
-        d_min, d_max = d.min(), d.max()
+    d_max_all = d.amax(dim=(1, 2), keepdim=True)
+    if (d_max_all > 1.0).any():
+        d = d / 255.0
+    d_min = d.amin(dim=(1, 2), keepdim=True)
+    d_max = d.amax(dim=(1, 2), keepdim=True)
     d_range = d_max - d_min
-    d = torch.where(d_range > 1e-6, (d - d_min) / d_range.clamp(min=1e-6), torch.zeros_like(d))
-    return d
+    normalized_depth = torch.where(
+        d_range > 1e-6,
+        (d - d_min) / d_range.clamp(min=1e-6),
+        torch.zeros_like(d)
+    )
+
+    depth_shifted = normalized_depth - convergence_point
+    sign = torch.sign(depth_shifted)
+    abs_depth = torch.abs(depth_shifted)
+    offset_depth = sign * torch.pow(abs_depth, stereo_offset_exponent)
+
+    pixel_offset = offset_depth * divergence_px + separation_px  # [B, H, W]
+
+    # --- Compute gap mask via forward mapping ---
+    col_indices = torch.arange(W, device=device, dtype=torch.float32).unsqueeze(0).unsqueeze(0).expand(B, H, W)
+    dest_cols = (col_indices + pixel_offset).long()
+
+    valid_dest = (dest_cols >= 0) & (dest_cols < W)
+    dest_clamped = dest_cols.clamp(0, W - 1)
+
+    hit_count = torch.zeros(B, H, W, device=device)
+    hit_count.scatter_add_(2, dest_clamped, valid_dest.float())
+    gap_mask = hit_count < 0.5
+
+    # Dilate at depth edges (ghosting fix)
+    offset_grad = torch.abs(pixel_offset[:, :, 1:] - pixel_offset[:, :, :-1])
+    depth_edge = torch.zeros(B, H, W, dtype=torch.bool, device=device)
+    depth_edge[:, :, :-1] = offset_grad > 1.5
+    depth_edge[:, :, 1:] = depth_edge[:, :, 1:] | (offset_grad > 1.5)
+
+    dilated = gap_mask.clone()
+    dilated[:, :, 1:] = dilated[:, :, 1:] | (gap_mask[:, :, :-1] & depth_edge[:, :, 1:])
+    dilated[:, :, :-1] = dilated[:, :, :-1] | (gap_mask[:, :, 1:] & depth_edge[:, :, :-1])
+    gap_mask = dilated
+
+    # --- Create warp grid ---
+    offset_normalized = pixel_offset / (W / 2)
+
+    y_coords = torch.linspace(-1, 1, H, device=device)
+    x_coords = torch.linspace(-1, 1, W, device=device)
+    grid_y, grid_x = torch.meshgrid(y_coords, x_coords, indexing='ij')
+    grid_x = grid_x.unsqueeze(0).expand(B, -1, -1)
+    grid_y = grid_y.unsqueeze(0).expand(B, -1, -1)
+
+    grid_x_warped = grid_x - offset_normalized
+
+    # --- Edge stretching: interpolate warp grid at gap positions ---
+    # Instead of sampling from invalid positions, gap pixels sample from
+    # smoothly interpolated source positions between the fg and bg borders.
+    if gap_mask.any():
+        valid_pixels = ~gap_mask
+        cols = torch.arange(W, device=device, dtype=torch.long).unsqueeze(0).unsqueeze(0).expand(B, H, W)
+
+        # Find nearest valid pixel on left (cummax)
+        left_valid_col = torch.where(valid_pixels, cols, torch.full_like(cols, -1))
+        left_nearest, _ = torch.cummax(left_valid_col, dim=2)
+        left_dist = (cols - left_nearest).float()
+        has_left = left_nearest >= 0
+
+        # Find nearest valid pixel on right (reverse cummax)
+        right_valid_flip = torch.where(
+            torch.flip(valid_pixels, [2]),
+            torch.flip(cols, [2]),
+            torch.full_like(cols, -1)
+        )
+        right_nearest_flip, _ = torch.cummax(right_valid_flip, dim=2)
+        right_nearest = torch.flip(right_nearest_flip, [2])
+        right_dist = (right_nearest - cols).float()
+        has_right = right_nearest >= 0
+
+        # Edge stretching: magnify a few valid border pixels across each gap half.
+        # Instead of interpolating between distant source positions (which sweeps
+        # through the original image), each half of the gap samples from a small
+        # range of actual valid warped grid values near its border — stretching
+        # those few pixels to fill the gap like a rubber band.
+        total_dist = torch.clamp(left_dist + right_dist, min=1.0)
+        half_gap = total_dist * 0.5
+
+        # Number of valid border pixels to stretch across each half-gap
+        stretch_pixels = 3
+
+        # Left side: gather grid_x at border and K pixels deeper into valid region
+        left_base_grid = grid_x_warped.gather(2, left_nearest.clamp(0, W - 1))
+        left_deep_grid = grid_x_warped.gather(2, (left_nearest - stretch_pixels).clamp(0, W - 1))
+        # Map left gap distance [0, half_gap] to source range [border, border-K]
+        left_t = torch.clamp(left_dist / half_gap, 0.0, 1.0)
+        left_stretch = left_base_grid * (1.0 - left_t) + left_deep_grid * left_t
+
+        # Right side: gather grid_x at border and K pixels deeper into valid region
+        right_base_grid = grid_x_warped.gather(2, right_nearest.clamp(0, W - 1))
+        right_deep_grid = grid_x_warped.gather(2, (right_nearest + stretch_pixels).clamp(0, W - 1))
+        # Map right gap distance [0, half_gap] to source range [border, border+K]
+        right_t = torch.clamp(right_dist / half_gap, 0.0, 1.0)
+        right_stretch = right_base_grid * (1.0 - right_t) + right_deep_grid * right_t
+
+        # Blend between left-stretched and right-stretched in the middle zone
+        t = left_dist / total_dist  # 0 at left border, 1 at right border
+        t = torch.where(~has_left, torch.ones_like(t), t)
+        t = torch.where(~has_right, torch.zeros_like(t), t)
+        blend = torch.clamp((t - 0.35) / 0.3, 0.0, 1.0)
+        blend = blend * blend * (3.0 - 2.0 * blend)  # smoothstep
+
+        gap_grid_x = left_stretch * (1.0 - blend) + right_stretch * blend
+        grid_x_warped = torch.where(gap_mask, gap_grid_x, grid_x_warped)
+
+    # --- Single grid_sample with filled grid ---
+    grid = torch.stack([grid_x_warped, grid_y], dim=-1)  # [B, H, W, 2]
+    warped = F.grid_sample(
+        image_tensor, grid,
+        mode='bilinear', padding_mode='border', align_corners=True
+    )
+
+    return warped, gap_mask
+
+
+def forward_warp_gpu(image_tensor, depth_tensor, divergence_px, separation_px,
+                     stereo_offset_exponent, convergence_point=0.5,
+                     gradient_threshold=1.5, max_stretch=8):
+    """
+    GPU forward-mapping stereo warp with gradient-aware connectivity.
+
+    Forward-maps each source pixel to its destination. Adjacent source pixels with
+    similar offsets are "connected" — the output range between their destinations is
+    filled by interpolation (like mesh triangles stretching). At depth discontinuities,
+    connectivity breaks and gaps appear naturally.
+
+    The forward map is then inverted to build a source-coordinate grid for grid_sample,
+    which renders the final image from the original (unwarped) source with clean
+    bilinear interpolation.
+
+    Args:
+        image_tensor: [B, C, H, W] input image, values 0-1
+        depth_tensor: [B, H, W] depth map (0-255 or 0-1)
+        divergence_px: horizontal shift in pixels
+        separation_px: additional constant separation in pixels
+        stereo_offset_exponent: power curve for depth-to-offset mapping
+        convergence_point: which depth maps to zero offset (0.0-1.0)
+        gradient_threshold: max offset difference between adjacent pixels to be connected
+        max_stretch: max output pixels a single source pair can span
+
+    Returns:
+        warped: [B, C, H, W] warped image with clean bilinear colors
+        gap_mask: [B, H, W] bool tensor, True = disocclusion gap
+    """
+    device = _get_device(depth_tensor, image_tensor)
+    image_tensor = image_tensor.to(device)
+    depth_tensor = depth_tensor.to(device)
+
+    B, _, H, W = image_tensor.shape
+
+    # --- Step 1: Compute pixel offset from depth ---
+    d = depth_tensor.clone()
+    d_max_all = d.amax(dim=(1, 2), keepdim=True)
+    if (d_max_all > 1.0).any():
+        d = d / 255.0
+    d_min = d.amin(dim=(1, 2), keepdim=True)
+    d_max = d.amax(dim=(1, 2), keepdim=True)
+    d_range = d_max - d_min
+    normalized_depth = torch.where(
+        d_range > 1e-6,
+        (d - d_min) / d_range.clamp(min=1e-6),
+        torch.zeros_like(d)
+    )
+
+    depth_shifted = normalized_depth - convergence_point
+    sign = torch.sign(depth_shifted)
+    abs_depth = torch.abs(depth_shifted)
+    offset_depth = sign * torch.pow(abs_depth, stereo_offset_exponent)
+
+    pixel_offset = offset_depth * divergence_px + separation_px  # [B, H, W]
+
+    # --- Step 2: Compute forward destinations (sub-pixel float) ---
+    col_float = torch.arange(W, device=device, dtype=torch.float32).view(1, 1, W).expand(B, H, W)
+    dest = col_float + pixel_offset  # [B, H, W]
+
+    # --- Step 3: Determine connectivity ---
+    # Connected if offset difference between adjacent pixels is below threshold
+    offset_diff = torch.abs(pixel_offset[:, :, 1:] - pixel_offset[:, :, :-1])
+    connected = offset_diff < gradient_threshold  # [B, H, W-1]
+
+    # --- Step 4: Build inverse source map via fixed-iteration scatter with z-buffer ---
+    source_map = torch.full((B, H, W), -1.0, device=device, dtype=torch.float32)
+    z_buffer = torch.full((B, H, W), -1.0, device=device, dtype=torch.float32)
+
+    # Paired values for connected segments [B, H, W-1]
+    dest_left = dest[:, :, :-1]
+    dest_right = dest[:, :, 1:]
+    depth_left = normalized_depth[:, :, :-1]
+    depth_right = normalized_depth[:, :, 1:]
+
+    # Start of output range: minimum destination of each pair
+    dest_min = torch.min(dest_left, dest_right)
+    floor_start = torch.floor(dest_min).long()
+
+    # Source column indices for the left pixel in each pair
+    src_col_base = torch.arange(W - 1, device=device, dtype=torch.float32).view(1, 1, W - 1).expand(B, H, W - 1)
+
+    # Segment width (can be negative for reversed segments)
+    segment_width = dest_right - dest_left
+    safe_width = torch.where(segment_width.abs() < 1e-4,
+                             torch.ones_like(segment_width),
+                             segment_width)
+
+    for k in range(max_stretch):
+        c = floor_start + k  # [B, H, W-1] target output column
+        c_safe = c.clamp(0, W - 1)
+
+        # Fractional position within the segment: 0 at dest_left, 1 at dest_right
+        # No +0.5: pixel centers are at integer positions (align_corners=True)
+        frac = (c.float() - dest_left) / safe_width
+
+        # Half-open [0, 1): each pair owns up to but not including the next pair's start
+        # This prevents two pairs from claiming the same output column
+        valid = connected & (c >= 0) & (c < W) & (frac >= 0.0) & (frac < 1.0)
+
+        # Interpolated source position and depth
+        src_pos = src_col_base + frac
+        interp_depth = depth_left * (1.0 - frac) + depth_right * frac
+
+        # Z-buffer: only write if this depth is closer (higher = closer to camera)
+        current_z = z_buffer.gather(2, c_safe)
+        current_src = source_map.gather(2, c_safe)
+
+        better = valid & (interp_depth > current_z + 1e-6)
+
+        new_z = torch.where(better, interp_depth, current_z)
+        new_src = torch.where(better, src_pos, current_src)
+
+        z_buffer.scatter_(2, c_safe, new_z)
+        source_map.scatter_(2, c_safe, new_src)
+
+    # --- Step 5: Fill disocclusion gaps ---
+    unfilled = source_map < 0  # [B, H, W] — the gap mask
+    cols = torch.arange(W, device=device, dtype=torch.long).view(1, 1, W).expand(B, H, W)
+    filled_mask = ~unfilled
+
+    # Find nearest filled pixel on left
+    left_col = torch.where(filled_mask, cols, torch.full_like(cols, -1))
+    left_nearest, _ = torch.cummax(left_col, dim=2)
+    has_left = left_nearest >= 0
+
+    # Find nearest filled pixel on right
+    right_col_flip = torch.where(
+        torch.flip(filled_mask, [2]),
+        torch.flip(cols, [2]),
+        torch.full_like(cols, -1)
+    )
+    right_nearest_flip, _ = torch.cummax(right_col_flip, dim=2)
+    right_nearest = torch.flip(right_nearest_flip, [2])
+    has_right = right_nearest >= 0
+
+    # Gather source positions and depths at gap borders
+    left_src = source_map.gather(2, left_nearest.clamp(0, W - 1))
+    right_src = source_map.gather(2, right_nearest.clamp(0, W - 1))
+    left_z = z_buffer.gather(2, left_nearest.clamp(0, W - 1))
+    right_z = z_buffer.gather(2, right_nearest.clamp(0, W - 1))
+
+    # Linear interpolation parameter
+    left_dist = (cols - left_nearest).float()
+    right_dist = (right_nearest - cols).float()
+    total_dist = (left_dist + right_dist).clamp(min=1.0)
+    t = left_dist / total_dist  # 0 at left border, 1 at right border
+
+    t = torch.where(~has_left, torch.ones_like(t), t)
+    t = torch.where(~has_right, torch.zeros_like(t), t)
+
+    # Background bias: favor the side with lower depth (background)
+    left_is_bg = left_z < right_z
+    t_biased = torch.where(left_is_bg,
+                           t.pow(0.5),                    # push toward left (bg)
+                           1.0 - (1.0 - t).pow(0.5))     # push toward right (bg)
+
+    gap_src = left_src * (1.0 - t_biased) + right_src * t_biased
+    source_map = torch.where(unfilled & (has_left | has_right), gap_src, source_map)
+
+    # Clamp any remaining unfilled pixels
+    source_map = source_map.clamp(0, W - 1)
+
+    # --- Step 6: Convert source map to grid_sample grid ---
+    grid_x = source_map * 2.0 / (W - 1) - 1.0
+    grid_y = torch.linspace(-1, 1, H, device=device).view(1, H, 1).expand(B, H, W)
+
+    grid = torch.stack([grid_x, grid_y], dim=-1)  # [B, H, W, 2]
+    warped = F.grid_sample(
+        image_tensor, grid,
+        mode='bilinear', padding_mode='border', align_corners=True
+    )
+
+    return warped, unfilled
+
+
+def forward_warp_mesh(image_tensor, depth_tensor, divergence_px, separation_px,
+                      stereo_offset_exponent, convergence_point=0.5,
+                      gradient_threshold=1.5, max_stretch=8):
+    """
+    GPU mesh-based stereo warp using ModernGL OpenGL rasterization.
+    Drop-in replacement for forward_warp_gpu().
+
+    Builds a triangle mesh from the depth map (each pixel = vertex), removes
+    triangles at depth discontinuities, displaces vertices by the stereo offset,
+    and rasterizes with hardware z-buffering for clean, artifact-free results.
+
+    Args:
+        image_tensor: [B, C, H, W] input image, values 0-1
+        depth_tensor: [B, H, W] depth map (0-255 or 0-1)
+        divergence_px: horizontal shift in pixels
+        separation_px: additional constant separation in pixels
+        stereo_offset_exponent: power curve for depth-to-offset mapping
+        convergence_point: which depth maps to zero offset (0.0-1.0)
+        gradient_threshold: max offset difference between triangle vertices to keep
+        max_stretch: unused (kept for API compatibility)
+
+    Returns:
+        warped: [B, C, H, W] warped image
+        gap_mask: [B, H, W] bool tensor, True = disocclusion gap
+    """
+    device = _get_device(depth_tensor, image_tensor)
+    image_tensor = image_tensor.to(device)
+    depth_tensor = depth_tensor.to(device)
+
+    B, C, H, W = image_tensor.shape
+    N_verts = H * W
+
+    # --- Step 1: Compute pixel offset from depth (identical to forward_warp_gpu) ---
+    d = depth_tensor.clone()
+    d_max_all = d.amax(dim=(1, 2), keepdim=True)
+    if (d_max_all > 1.0).any():
+        d = d / 255.0
+    d_min = d.amin(dim=(1, 2), keepdim=True)
+    d_max = d.amax(dim=(1, 2), keepdim=True)
+    d_range = d_max - d_min
+    normalized_depth = torch.where(
+        d_range > 1e-6,
+        (d - d_min) / d_range.clamp(min=1e-6),
+        torch.zeros_like(d)
+    )
+
+    depth_shifted = normalized_depth - convergence_point
+    sign = torch.sign(depth_shifted)
+    abs_depth = torch.abs(depth_shifted)
+    offset_depth = sign * torch.pow(abs_depth, stereo_offset_exponent)
+
+    pixel_offset = offset_depth * divergence_px + separation_px  # [B, H, W]
+
+    # --- Step 2: Build triangle indices (vectorized, on GPU then move to CPU) ---
+    y_idx = torch.arange(H - 1, device=device)
+    x_idx = torch.arange(W - 1, device=device)
+    yy, xx = torch.meshgrid(y_idx, x_idx, indexing='ij')  # [H-1, W-1]
+    yy_f = yy.reshape(-1)
+    xx_f = xx.reshape(-1)
+
+    v00 = yy_f * W + xx_f
+    v10 = yy_f * W + (xx_f + 1)
+    v01 = (yy_f + 1) * W + xx_f
+    v11 = (yy_f + 1) * W + (xx_f + 1)
+
+    tri_a = torch.stack([v00, v10, v01], dim=1)
+    tri_b = torch.stack([v11, v10, v01], dim=1)
+    all_tris = torch.cat([tri_a, tri_b], dim=0)  # [2*(H-1)*(W-1), 3]
+
+    # --- Step 3: Gradient-based triangle culling ---
+    offset_flat = pixel_offset.reshape(B, -1)
+
+    v0_off = offset_flat[:, all_tris[:, 0]]
+    v1_off = offset_flat[:, all_tris[:, 1]]
+    v2_off = offset_flat[:, all_tris[:, 2]]
+
+    max_diff = torch.max(
+        torch.max(torch.abs(v0_off - v1_off), torch.abs(v0_off - v2_off)),
+        torch.abs(v1_off - v2_off)
+    )
+
+    # Keep triangle if it passes in ANY batch item
+    keep = (max_diff < gradient_threshold).any(dim=0)
+    tri_filtered = all_tris[keep].contiguous()
+
+    # Convert indices to numpy for OpenGL
+    indices_np = tri_filtered.cpu().numpy().astype(np.int32)
+
+    # --- Step 4: Compute vertex positions ---
+    col_float = torch.arange(W, device=device, dtype=torch.float32).view(1, 1, W).expand(B, H, W)
+    row_float = torch.arange(H, device=device, dtype=torch.float32).view(1, H, 1).expand(B, H, W)
+
+    dest_x = col_float + pixel_offset
+    dest_y = row_float
+
+    # Convert to clip space [-1, 1] for OpenGL
+    clip_x = dest_x / (W - 1) * 2.0 - 1.0
+    clip_y = -(dest_y / (H - 1) * 2.0 - 1.0)  # flip Y for OpenGL
+    # Map depth to NDC z range [-0.99, 0.99]: closer objects get smaller z (wins '<' test)
+    # Use [-.99, .99] instead of [-1, 1] to avoid clipping at the exact clip planes
+    clip_z = (1.0 - normalized_depth) * 1.98 - 0.99
+
+    # Per-vertex colors [B, H*W, C]
+    vertex_colors = image_tensor.permute(0, 2, 3, 1).reshape(B, N_verts, C)
+
+    # --- Step 5: Rasterize each batch item with ModernGL ---
+    ctx = _get_moderngl_context()
+
+    # Create shader program (reuse across batch items)
+    prog = ctx.program(
+        vertex_shader='''
+            #version 330
+            in vec3 in_position;
+            in vec3 in_color;
+            out vec3 v_color;
+            void main() {
+                gl_Position = vec4(in_position.xy, in_position.z, 1.0);
+                v_color = in_color;
+            }
+        ''',
+        fragment_shader='''
+            #version 330
+            in vec3 v_color;
+            layout(location = 0) out vec4 fragColor;
+            layout(location = 1) out float fragFlag;
+            void main() {
+                fragColor = vec4(v_color, 1.0);
+                fragFlag = 1.0;
+            }
+        ''',
+    )
+
+    # Create index buffer (shared across batch — same triangle topology)
+    ibo = ctx.buffer(indices_np.tobytes())
+
+    # Create framebuffer attachments
+    color_tex = ctx.texture((W, H), 4, dtype='f4')
+    flag_tex = ctx.texture((W, H), 1, dtype='f4')
+    depth_rb = ctx.depth_renderbuffer((W, H))
+    fbo = ctx.framebuffer(
+        color_attachments=[color_tex, flag_tex],
+        depth_attachment=depth_rb
+    )
+
+    results = []
+    masks = []
+
+    for b in range(B):
+        # Build interleaved vertex data: [x, y, z, r, g, b] per vertex
+        positions = torch.stack([
+            clip_x[b].reshape(-1),
+            clip_y[b].reshape(-1),
+            clip_z[b].reshape(-1),
+        ], dim=1)  # [N_verts, 3]
+        colors = vertex_colors[b]  # [N_verts, C]
+
+        vertex_data = torch.cat([positions, colors], dim=1)  # [N_verts, 6]
+        vertex_np = vertex_data.cpu().numpy().astype(np.float32)
+
+        vbo = ctx.buffer(vertex_np.tobytes())
+        vao = ctx.vertex_array(prog, [(vbo, '3f 3f', 'in_position', 'in_color')], ibo)
+
+        fbo.use()
+        ctx.enable(moderngl.DEPTH_TEST)
+        ctx.depth_func = '<'  # smaller z = closer to camera = wins depth test
+        fbo.clear(red=0.0, green=0.0, blue=0.0, alpha=0.0, depth=1.0)
+        vao.render(moderngl.TRIANGLES)
+
+        # Read back results
+        color_data = np.frombuffer(color_tex.read(), dtype=np.float32).reshape(H, W, 4)
+        flag_data = np.frombuffer(flag_tex.read(), dtype=np.float32).reshape(H, W)
+
+        # OpenGL renders bottom-up, flip to top-down
+        color_data = color_data[::-1].copy()
+        flag_data = flag_data[::-1].copy()
+
+        results.append(color_data[:, :, :3])  # RGB only
+        masks.append(flag_data < 0.5)  # True = gap (unfilled)
+
+        vbo.release()
+        vao.release()
+
+    # Clean up OpenGL resources
+    ibo.release()
+    color_tex.release()
+    flag_tex.release()
+    depth_rb.release()
+    fbo.release()
+    prog.release()
+
+    # Convert results back to torch tensors
+    warped_np = np.stack(results, axis=0)  # [B, H, W, 3]
+    gap_mask_np = np.stack(masks, axis=0)  # [B, H, W]
+
+    warped = torch.from_numpy(warped_np).permute(0, 3, 1, 2).to(device)  # [B, C, H, W]
+    gap_mask = torch.from_numpy(gap_mask_np).to(device)  # [B, H, W]
+
+    # --- Step 6: Gap fill — extend background border color into gaps ---
+    # In stereo, gaps at depth edges reveal background (the area behind the foreground).
+    # So we fill from the background side (lower depth = farther from camera).
+    # If only one border exists, use that.
+    if gap_mask.any():
+        filled_mask = ~gap_mask
+        cols = torch.arange(W, device=device, dtype=torch.long).view(1, 1, W).expand(B, H, W)
+
+        # Nearest filled pixel on left
+        left_col = torch.where(filled_mask, cols, torch.full_like(cols, -1))
+        left_nearest, _ = torch.cummax(left_col, dim=2)
+        has_left = left_nearest >= 0
+
+        # Nearest filled pixel on right
+        right_col_flip = torch.where(
+            torch.flip(filled_mask, [2]),
+            torch.flip(cols, [2]),
+            torch.full_like(cols, -1)
+        )
+        right_nearest_flip, _ = torch.cummax(right_col_flip, dim=2)
+        right_nearest = torch.flip(right_nearest_flip, [2])
+        has_right = right_nearest >= 0
+
+        # Gather colors at borders
+        left_idx = left_nearest.clamp(0, W - 1).unsqueeze(1).expand_as(warped)
+        right_idx = right_nearest.clamp(0, W - 1).unsqueeze(1).expand_as(warped)
+        left_color = warped.gather(3, left_idx)
+        right_color = warped.gather(3, right_idx)
+
+        # Depth at borders — lower normalized_depth = farther = background
+        left_z = normalized_depth.gather(2, left_nearest.clamp(0, W - 1))
+        right_z = normalized_depth.gather(2, right_nearest.clamp(0, W - 1))
+
+        # Pick the background side (lower depth). If only one side exists, use it.
+        left_is_bg = left_z <= right_z
+        use_right = (has_right & ~has_left) | (has_left & has_right & ~left_is_bg)
+
+        # Default to left, override with right where appropriate
+        gap_fill = left_color  # [B, C, H, W]
+        use_right_4d = use_right.unsqueeze(1).expand_as(warped)
+        gap_fill = torch.where(use_right_4d, right_color, gap_fill)
+
+        gap_mask_4d = gap_mask.unsqueeze(1).expand_as(warped)
+        warped = torch.where(gap_mask_4d, gap_fill, warped)
+
+    return warped, gap_mask
 
 
 def compute_forward_mask_gpu(depth_tensor, divergence_px, separation_px,
@@ -282,16 +863,19 @@ def detect_disocclusions_gpu(depth_tensor, grid, grid_x_warped, device, threshol
     return disoccluded
 
 
-def interpolate_fill_gpu(image_tensor, mask, device, depth_tensor=None):
+def interpolate_fill_gpu(image_tensor, mask, device):
     """
-    Fill masked regions biased toward the background side. Fully vectorized.
+    Fill masked regions by stretching border pixels into gaps with linear interpolation.
     Supports batched inputs [B, C, H, W].
+
+    Mimics 'Fill - Naive interpolating': finds the nearest valid pixel on each side
+    of a gap and linearly interpolates between them. This gives a natural "stretched
+    edge" look without smearing or blurring artifacts.
 
     Args:
         image_tensor: [B, C, H, W] image tensor
         mask: [B, H, W] bool tensor, True = needs filling
         device: torch device
-        depth_tensor: [B, H, W] normalized depth (optional, for fg/bg detection)
 
     Returns:
         filled: [B, C, H, W] tensor with gaps filled
@@ -319,13 +903,14 @@ def interpolate_fill_gpu(image_tensor, mask, device, depth_tensor=None):
     right_dist = (right_nearest_col - cols).float()
     has_right = right_nearest_col >= 0
 
-    # Gather colors at nearest valid positions [B, C, H, W]
+    # Gather border colors directly from the nearest valid pixel (no averaging)
+    # This gives the "stretching" effect — each border pixel extends into the gap
     left_idx = left_nearest_col.clamp(0, W - 1).unsqueeze(1).expand(B, C, H, W)
     right_idx = right_nearest_col.clamp(0, W - 1).unsqueeze(1).expand(B, C, H, W)
-    left_colors = image_tensor.gather(3, left_idx)   # gather along W dim
+    left_colors = image_tensor.gather(3, left_idx)
     right_colors = image_tensor.gather(3, right_idx)
 
-    # Interpolation weight [B, H, W]: 0 = left border, 1 = right border
+    # Simple linear interpolation (matches naive_interpolating behavior)
     total_dist = torch.clamp(left_dist + right_dist, min=1.0)
     t = left_dist / total_dist
 
@@ -333,31 +918,10 @@ def interpolate_fill_gpu(image_tensor, mask, device, depth_tensor=None):
     t = torch.where(~has_left, torch.ones_like(t), t)
     t = torch.where(~has_right, torch.zeros_like(t), t)
 
-    # If we have depth info, bias fill toward background (lower depth) border
-    if depth_tensor is not None:
-        left_depth_idx = left_nearest_col.clamp(0, W - 1)
-        right_depth_idx = right_nearest_col.clamp(0, W - 1)
-        left_depth_at_border = depth_tensor.gather(2, left_depth_idx)   # gather along W
-        right_depth_at_border = depth_tensor.gather(2, right_depth_idx)
-
-        left_is_fg = left_depth_at_border > right_depth_at_border
-        t_biased = torch.where(left_is_fg, t.pow(1.5), 1.0 - (1.0 - t).pow(1.5))
-        t = torch.where(mask, t_biased, t)
-
-    # Expand t for broadcasting with [B, C, H, W]
+    # Expand for broadcasting with [B, C, H, W]
     t_expanded = t.unsqueeze(1)
     interpolated = left_colors * (1.0 - t_expanded) + right_colors * t_expanded
     filled = torch.where(mask.unsqueeze(1), interpolated, image_tensor)
-
-    # Vertical smoothing on filled regions to reduce horizontal streak artifacts
-    if mask.any():
-        v_kernel = torch.tensor([0.25, 0.5, 0.25], device=device, dtype=filled.dtype)
-        v_kernel = v_kernel.view(1, 1, 3, 1)
-        # Reshape to [B*C, 1, H, W] for grouped conv, then back to [B, C, H, W]
-        filled_bc = filled.view(B * C, 1, H, W)
-        blurred_bc = F.conv2d(filled_bc, v_kernel, padding=(1, 0))
-        blurred = blurred_bc.view(B, C, H, W)
-        filled = torch.where(mask.unsqueeze(1), blurred, filled)
 
     return filled
 
@@ -504,37 +1068,28 @@ def create_stereoimages_gpu(image_tensor, depth_tensor, divergence, separation=0
     right_divergence_px = (right_divergence / 100.0) * W
     separation_px = (separation / 100.0) * W
 
-    # Hybrid approach: grid_sample for fast pixel warping + forward-mapping mask
+    # Select warp function: ModernGL mesh rasterizer if available, else scatter-based fallback
+    if MODERNGL_AVAILABLE:
+        warp_fn = forward_warp_mesh
+    else:
+        warp_fn = forward_warp_gpu
+
     left_mask = torch.zeros(B, H, W, dtype=torch.bool, device=device)
     right_mask = torch.zeros(B, H, W, dtype=torch.bool, device=device)
 
     if left_divergence < 0.001:
         left_eye = image_tensor
     else:
-        left_eye = apply_stereo_divergence_gpu(
+        left_eye, left_mask = warp_fn(
             image_tensor, left_depth, +left_divergence_px, -separation_px,
             stereo_offset_exponent, convergence_point)
-        left_mask = compute_forward_mask_gpu(
-            left_depth, +left_divergence_px, -separation_px,
-            stereo_offset_exponent, convergence_point, device)
-        if left_mask.any():
-            left_depth_norm = _normalize_depth_01(
-                left_depth / 255.0 if left_depth.amax() > 1.0 else left_depth)
-            left_eye = interpolate_fill_gpu(left_eye, left_mask, device, depth_tensor=left_depth_norm)
 
     if right_divergence < 0.001:
         right_eye = image_tensor
     else:
-        right_eye = apply_stereo_divergence_gpu(
+        right_eye, right_mask = warp_fn(
             image_tensor, right_depth, -right_divergence_px, separation_px,
             stereo_offset_exponent, convergence_point)
-        right_mask = compute_forward_mask_gpu(
-            right_depth, -right_divergence_px, separation_px,
-            stereo_offset_exponent, convergence_point, device)
-        if right_mask.any():
-            right_depth_norm = _normalize_depth_01(
-                right_depth / 255.0 if right_depth.amax() > 1.0 else right_depth)
-            right_eye = interpolate_fill_gpu(right_eye, right_mask, device, depth_tensor=right_depth_norm)
 
     combined_mask = left_mask | right_mask
 
