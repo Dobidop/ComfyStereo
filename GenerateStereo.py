@@ -52,19 +52,19 @@ class StereoImageNode:
                 "depth_map": ("IMAGE",),
                 "modes": (["left-right", "right-left", "top-bottom", "bottom-top", "red-cyan-anaglyph"],),
                 "fill_technique": ([
-                     'No fill', 'No fill - Reverse projection', 'Imperfect fill - Hybrid Edge', 'Fill - Naive',
-                    'Fill - Naive interpolating', 'Fill - Polylines Soft', 'Fill - Polylines Sharp', 'GPU Warp (Fast)'#,
+                     'GPU Warp (Fast)', 'No fill', 'No fill - Reverse projection', 'Imperfect fill - Hybrid Edge', 'Fill - Naive',
+                    'Fill - Naive interpolating', 'Fill - Polylines Soft', 'Fill - Polylines Sharp'#,
                     #'Fill - Post-fill', 'Fill - Reverse projection with Post-fill', 'Fill - Hybrid Edge with fill'
-                ], {"default": "GPU Warp (Fast)"}),
+                ], {"default": "GPU Warp (Fast)", "tooltip": "The technique used to fill in disoccluded areas. 'GPU Warp (Fast)' uses a fast GPU-based warping method. 'No fill' leaves disoccluded areas black. 'No fill - Reverse projection' attempts to fill using reverse projection but may have artifacts. 'Imperfect fill - Hybrid Edge' uses a hybrid edge-based method that can produce better results but may still have imperfections. The various 'Fill' options use different algorithms to attempt to fill in missing areas, with varying quality and performance characteristics."}),
             },
             "optional": {
-                "divergence": ("FLOAT", {"default": 3.5, "min": 0.05, "max": 15, "step": 0.01}),
-                "separation": ("FLOAT", {"default": 0, "min": -5, "max": 5, "step": 0.01}),
-                "stereo_balance": ("FLOAT", {"default": 0, "min": -0.95, "max": 0.95, "step": 0.05}),
-                "convergence_point": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05}),
-                "stereo_offset_exponent": ("FLOAT", {"default": 2, "min": 0.1, "max": 2, "step": 0.11}),
-                "depth_map_blur": ("BOOLEAN", {"default": True}),
-                "depth_blur_edge_threshold": ("FLOAT", {"default": 6, "min": 0.1, "max": 15, "step": 0.1}),
+                "divergence": ("FLOAT", {"default": 3.5, "min": 0.05, "max": 15, "step": 0.01, "tooltip": "The strength of the stereo effect. Higher values create a more pronounced 3D effect but may cause discomfort if too high."}),
+                "separation": ("FLOAT", {"default": 0, "min": -5, "max": 5, "step": 0.01, "tooltip": "The separation of the stereo pairs. Positive values increase separation, while negative values decrease it. Adjusting this can help fine-tune the 3D effect and reduce ghosting."}),
+                "stereo_balance": ("FLOAT", {"default": 0, "min": -0.95, "max": 0.95, "step": 0.05, "tooltip": "Adjusts the balance between the left and right images. Positive values favor the left image, while negative values favor the right image. This can help correct for any imbalance in the stereo effect."}),
+                "convergence_point": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Controls the depth at which the stereo effect converges. 0.0 means convergence at the back, 1.0 means convergence at the front."}),
+                "stereo_offset_exponent": ("FLOAT", {"default": 2, "min": 0.1, "max": 2, "step": 0.1, "tooltip": "Controls the curve of the depth mapping. Higher values create a more pronounced effect at closer depths, while lower values create a more uniform effect across all depths."}),
+                "depth_map_blur": ("BOOLEAN", {"default": True, "tooltip": "Whether to apply a blur to the depth map before processing. Blurring can help reduce noise and create smoother depth transitions, which can improve the quality of the stereo effect, especially in areas with high-frequency details."}),
+                "depth_blur_edge_threshold": ("FLOAT", {"default": 6, "min": 0.1, "max": 15, "step": 0.1, "tooltip": "When depth map blurring is enabled, this threshold controls how aggressively edges are preserved. Lower values will preserve more edges, while higher values will allow more blurring across edges."}),
                 "batch_size": ("INT", {"default": 24, "min": 1, "max": 128, "step": 1, "tooltip": "Number of frames to process before clearing GPU memory. Lower values use less memory but may be slower."}),
             }
         }

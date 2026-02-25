@@ -1,0 +1,912 @@
+{
+  "id": "d580d18f-cc52-42c6-95a9-c9710cc68a6f",
+  "revision": 0,
+  "last_node_id": 36,
+  "last_link_id": 83,
+  "nodes": [
+    {
+      "id": 3,
+      "type": "StereoImageNode",
+      "pos": [
+        -334.8667815743612,
+        -752.0194814392968
+      ],
+      "size": [
+        380.8333435058594,
+        441.3333435058594
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 16
+        },
+        {
+          "name": "depth_map",
+          "type": "IMAGE",
+          "link": 83
+        }
+      ],
+      "outputs": [
+        {
+          "name": "stereoscope",
+          "type": "IMAGE",
+          "links": [
+            46
+          ]
+        },
+        {
+          "name": "blurred_depthmap_left",
+          "type": "IMAGE",
+          "links": []
+        },
+        {
+          "name": "blurred_depthmap_right",
+          "type": "IMAGE",
+          "links": []
+        },
+        {
+          "name": "no_fill_imperfect_mask",
+          "type": "MASK",
+          "links": []
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfystereo",
+        "ver": "c30ab12321b0b759c8757e0c287b846fe92558fd",
+        "Node name for S&R": "StereoImageNode"
+      },
+      "widgets_values": [
+        "left-right",
+        "GPU Warp (Fast)",
+        3.5,
+        0,
+        0,
+        0.5,
+        2,
+        true,
+        3,
+        24
+      ]
+    },
+    {
+      "id": 12,
+      "type": "LoadVideo",
+      "pos": [
+        -1458.0892983318709,
+        -1018.2617486263313
+      ],
+      "size": [
+        282.8333435058594,
+        512.683349609375
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "VIDEO",
+          "type": "VIDEO",
+          "links": [
+            15
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.12.3",
+        "Node name for S&R": "LoadVideo"
+      },
+      "widgets_values": [
+        "example-video.mp4",
+        "image"
+      ]
+    },
+    {
+      "id": 13,
+      "type": "LoadVideo",
+      "pos": [
+        -1467.9184957346988,
+        -408.551004824679
+      ],
+      "size": [
+        282.8333435058594,
+        512.683349609375
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "VIDEO",
+          "type": "VIDEO",
+          "links": [
+            17
+          ]
+        }
+      ],
+      "title": "Depth map video",
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.12.3",
+        "Node name for S&R": "LoadVideo"
+      },
+      "widgets_values": [
+        "depthmap_video_00001.webm",
+        "image"
+      ]
+    },
+    {
+      "id": 14,
+      "type": "GetVideoComponents",
+      "pos": [
+        -1106.7973979219996,
+        -1017.1141003575786
+      ],
+      "size": [
+        225,
+        96
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "link": 15
+        }
+      ],
+      "outputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "links": [
+            16,
+            62
+          ]
+        },
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "links": null
+        },
+        {
+          "name": "fps",
+          "type": "FLOAT",
+          "links": [
+            65,
+            71
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.12.3",
+        "Node name for S&R": "GetVideoComponents"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 15,
+      "type": "GetVideoComponents",
+      "pos": [
+        -1119.8636353266568,
+        -407.82956011163265
+      ],
+      "size": [
+        225,
+        96
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "link": 17
+        }
+      ],
+      "outputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "links": [
+            81
+          ]
+        },
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "links": null
+        },
+        {
+          "name": "fps",
+          "type": "FLOAT",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.12.3",
+        "Node name for S&R": "GetVideoComponents"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 16,
+      "type": "VHS_VideoCombine",
+      "pos": [
+        78.24004076778684,
+        -930.3650950244481
+      ],
+      "size": [
+        225,
+        491.98275862068965
+      ],
+      "flags": {},
+      "order": 11,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 46
+        },
+        {
+          "name": "audio",
+          "shape": 7,
+          "type": "AUDIO",
+          "link": null
+        },
+        {
+          "name": "meta_batch",
+          "shape": 7,
+          "type": "VHS_BatchManager",
+          "link": null
+        },
+        {
+          "name": "vae",
+          "shape": 7,
+          "type": "VAE",
+          "link": null
+        },
+        {
+          "name": "frame_rate",
+          "type": "FLOAT",
+          "widget": {
+            "name": "frame_rate"
+          },
+          "link": 71
+        }
+      ],
+      "outputs": [
+        {
+          "name": "Filenames",
+          "type": "VHS_FILENAMES",
+          "links": [
+            21
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui-videohelpersuite",
+        "ver": "1.7.9",
+        "Node name for S&R": "VHS_VideoCombine"
+      },
+      "widgets_values": {
+        "frame_rate": 8,
+        "loop_count": 0,
+        "filename_prefix": "AnimateDiff",
+        "format": "video/webm",
+        "pix_fmt": "yuv420p",
+        "crf": 20,
+        "save_metadata": true,
+        "trim_to_audio": false,
+        "pingpong": false,
+        "save_output": true,
+        "videopreview": {
+          "hidden": false,
+          "paused": true,
+          "params": {
+            "filename": "AnimateDiff_00079.webm",
+            "subfolder": "",
+            "type": "output",
+            "format": "video/webm",
+            "frame_rate": 24,
+            "workflow": "AnimateDiff_00079.png",
+            "fullpath": "C:\\StableDiffusion\\2026-02-06\\ComfyUI_windows_portable\\ComfyUI\\output\\AnimateDiff_00079.webm"
+          }
+        }
+      }
+    },
+    {
+      "id": 17,
+      "type": "VHS_SelectFilename",
+      "pos": [
+        322.91624944124567,
+        -930.1454536777992
+      ],
+      "size": [
+        225,
+        76
+      ],
+      "flags": {},
+      "order": 12,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "filenames",
+          "type": "VHS_FILENAMES",
+          "link": 21
+        }
+      ],
+      "outputs": [
+        {
+          "name": "Filename",
+          "type": "STRING",
+          "links": [
+            22
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui-videohelpersuite",
+        "ver": "1.7.9",
+        "Node name for S&R": "VHS_SelectFilename"
+      },
+      "widgets_values": {
+        "index": -1
+      }
+    },
+    {
+      "id": 18,
+      "type": "NativeStereoVideoViewer",
+      "pos": [
+        569.0984060556857,
+        -937.236600120775
+      ],
+      "size": [
+        366.0333251953125,
+        312
+      ],
+      "flags": {},
+      "order": 13,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video_path",
+          "type": "STRING",
+          "widget": {
+            "name": "video_path"
+          },
+          "link": 22
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "cnr_id": "comfystereo",
+        "ver": "452cc1f6abbea0fb4ae5968e6762d45bcf339099",
+        "Node name for S&R": "NativeStereoVideoViewer"
+      },
+      "widgets_values": [
+        "",
+        "Side-by-Side",
+        "Flat Screen",
+        3,
+        3,
+        false,
+        true,
+        true,
+        "Black"
+      ]
+    },
+    {
+      "id": 20,
+      "type": "LoadVideoDepthAnythingModel",
+      "pos": [
+        -1094.7906827321542,
+        -1711.0907814319442
+      ],
+      "size": [
+        326.4666748046875,
+        82.66666412353516
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "vda_model",
+          "type": "VDAMODEL",
+          "links": [
+            63
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "ComfyUI-Video-Depth-Anything",
+        "ver": "a0db08e63d1ea571601c45cde4aaee0acdd0544d",
+        "Node name for S&R": "LoadVideoDepthAnythingModel"
+      },
+      "widgets_values": [
+        "video_depth_anything_vitl.pth"
+      ]
+    },
+    {
+      "id": 21,
+      "type": "VideoDepthAnythingProcess",
+      "pos": [
+        -710.4938995940996,
+        -1709.7308827645325
+      ],
+      "size": [
+        301.7833251953125,
+        170.6666717529297
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "vda_model",
+          "type": "VDAMODEL",
+          "link": 63
+        },
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 62
+        }
+      ],
+      "outputs": [
+        {
+          "name": "depths",
+          "type": "DEPTHS",
+          "links": [
+            29
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "ComfyUI-Video-Depth-Anything",
+        "ver": "a0db08e63d1ea571601c45cde4aaee0acdd0544d",
+        "Node name for S&R": "VideoDepthAnythingProcess"
+      },
+      "widgets_values": [
+        518,
+        1280,
+        "fp16"
+      ]
+    },
+    {
+      "id": 22,
+      "type": "VideoDepthAnythingOutput",
+      "pos": [
+        -374.76586160288133,
+        -1709.7887197945886
+      ],
+      "size": [
+        225,
+        97.86666870117188
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "depths",
+          "type": "DEPTHS",
+          "link": 29
+        }
+      ],
+      "outputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "links": [
+            80,
+            82
+          ]
+        }
+      ],
+      "properties": {
+        "cnr_id": "ComfyUI-Video-Depth-Anything",
+        "ver": "a0db08e63d1ea571601c45cde4aaee0acdd0544d",
+        "Node name for S&R": "VideoDepthAnythingOutput"
+      },
+      "widgets_values": [
+        "gray"
+      ]
+    },
+    {
+      "id": 23,
+      "type": "VHS_VideoCombine",
+      "pos": [
+        -4.8301908592440554,
+        -1754.9186405824378
+      ],
+      "size": [
+        225,
+        651.9655172413793
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 80
+        },
+        {
+          "name": "audio",
+          "shape": 7,
+          "type": "AUDIO",
+          "link": null
+        },
+        {
+          "name": "meta_batch",
+          "shape": 7,
+          "type": "VHS_BatchManager",
+          "link": null
+        },
+        {
+          "name": "vae",
+          "shape": 7,
+          "type": "VAE",
+          "link": null
+        },
+        {
+          "name": "frame_rate",
+          "type": "FLOAT",
+          "widget": {
+            "name": "frame_rate"
+          },
+          "link": 65
+        }
+      ],
+      "outputs": [
+        {
+          "name": "Filenames",
+          "type": "VHS_FILENAMES",
+          "links": []
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfyui-videohelpersuite",
+        "ver": "1.7.9",
+        "Node name for S&R": "VHS_VideoCombine"
+      },
+      "widgets_values": {
+        "frame_rate": 8,
+        "loop_count": 0,
+        "filename_prefix": "depthmap_video",
+        "format": "video/webm",
+        "pix_fmt": "yuv420p",
+        "crf": 20,
+        "save_metadata": true,
+        "trim_to_audio": false,
+        "pingpong": false,
+        "save_output": true,
+        "videopreview": {
+          "hidden": false,
+          "paused": true,
+          "params": {
+            "filename": "depthmap_video_00001.webm",
+            "subfolder": "",
+            "type": "output",
+            "format": "video/webm",
+            "frame_rate": 24,
+            "workflow": "depthmap_video_00001.png",
+            "fullpath": "C:\\StableDiffusion\\2026-02-06\\ComfyUI_windows_portable\\ComfyUI\\output\\depthmap_video_00001.webm"
+          }
+        }
+      }
+    },
+    {
+      "id": 35,
+      "type": "Reroute",
+      "pos": [
+        -665.1299731609381,
+        -572.0607848209918
+      ],
+      "size": [
+        75,
+        26
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "",
+          "type": "*",
+          "link": 81
+        }
+      ],
+      "outputs": [
+        {
+          "name": "",
+          "type": "IMAGE",
+          "links": null
+        }
+      ],
+      "properties": {
+        "showOutputText": false,
+        "horizontal": false
+      }
+    },
+    {
+      "id": 36,
+      "type": "Reroute",
+      "pos": [
+        -668.7663367973012,
+        -650.2582253466833
+      ],
+      "size": [
+        75,
+        26
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "",
+          "type": "*",
+          "link": 82
+        }
+      ],
+      "outputs": [
+        {
+          "name": "",
+          "type": "IMAGE",
+          "links": [
+            83
+          ]
+        }
+      ],
+      "properties": {
+        "showOutputText": false,
+        "horizontal": false
+      }
+    }
+  ],
+  "links": [
+    [
+      15,
+      12,
+      0,
+      14,
+      0,
+      "VIDEO"
+    ],
+    [
+      16,
+      14,
+      0,
+      3,
+      0,
+      "IMAGE"
+    ],
+    [
+      17,
+      13,
+      0,
+      15,
+      0,
+      "VIDEO"
+    ],
+    [
+      21,
+      16,
+      0,
+      17,
+      0,
+      "VHS_FILENAMES"
+    ],
+    [
+      22,
+      17,
+      0,
+      18,
+      0,
+      "STRING"
+    ],
+    [
+      29,
+      21,
+      0,
+      22,
+      0,
+      "DEPTHS"
+    ],
+    [
+      46,
+      3,
+      0,
+      16,
+      0,
+      "IMAGE"
+    ],
+    [
+      62,
+      14,
+      0,
+      21,
+      1,
+      "IMAGE"
+    ],
+    [
+      63,
+      20,
+      0,
+      21,
+      0,
+      "VDAMODEL"
+    ],
+    [
+      65,
+      14,
+      2,
+      23,
+      4,
+      "FLOAT"
+    ],
+    [
+      71,
+      14,
+      2,
+      16,
+      4,
+      "FLOAT"
+    ],
+    [
+      80,
+      22,
+      0,
+      23,
+      0,
+      "IMAGE"
+    ],
+    [
+      81,
+      15,
+      0,
+      35,
+      0,
+      "IMAGE"
+    ],
+    [
+      82,
+      22,
+      0,
+      36,
+      0,
+      "IMAGE"
+    ],
+    [
+      83,
+      36,
+      0,
+      3,
+      1,
+      "IMAGE"
+    ]
+  ],
+  "groups": [
+    {
+      "id": 1,
+      "title": "Video depthmap generation, bypas to skip",
+      "bounding": [
+        -1117.634264499339,
+        -1823.9034727982612,
+        1423.9564485438834,
+        711.3974090997208
+      ],
+      "color": "#a1309b",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "id": 2,
+      "title": "Video for stereo generation",
+      "bounding": [
+        -1468.082307894222,
+        -1091.8809669224233,
+        596.2849270563099,
+        576.9735783017915
+      ],
+      "color": "#8A8",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "id": 3,
+      "title": "Depth map video",
+      "bounding": [
+        -1477.9401535477384,
+        -482.1380015817632,
+        602.4996779624905,
+        581.8500152587891
+      ],
+      "color": "#8A8",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "id": 4,
+      "title": "Stereo generation+launch stereo viewer",
+      "bounding": [
+        -353.4114650507463,
+        -1001.0296166159737,
+        1304.908034035991,
+        690.0868126138283
+      ],
+      "color": "#3f789e",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "id": 5,
+      "title": "Select depth map source",
+      "bounding": [
+        -687.8572458882109,
+        -728.4036798921378,
+        299.3801652892571,
+        220.14454796370785
+      ],
+      "color": "#8A8",
+      "font_size": 24,
+      "flags": {}
+    }
+  ],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.5500000000000003,
+      "offset": [
+        1687.675504604318,
+        1894.0433289379807
+      ]
+    },
+    "workflowRendererVersion": "Vue",
+    "frontendVersion": "1.37.11",
+    "VHS_latentpreview": false,
+    "VHS_latentpreviewrate": 0,
+    "VHS_MetadataImage": true,
+    "VHS_KeepIntermediate": true,
+    "reroutes": [
+      {
+        "id": 1,
+        "pos": [
+          -321.97393083289825,
+          -1061.059404475044
+        ],
+        "linkIds": [
+          65,
+          71
+        ]
+      }
+    ],
+    "linkExtensions": [
+      {
+        "id": 65,
+        "parentId": 1
+      },
+      {
+        "id": 71,
+        "parentId": 1
+      }
+    ]
+  },
+  "version": 0.4
+}

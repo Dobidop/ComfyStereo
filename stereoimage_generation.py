@@ -555,28 +555,36 @@ def forward_warp_mesh(image_tensor, depth_tensor, divergence_px, separation_px,
     # Per-vertex colors [B, H*W, C]
     vertex_colors = image_tensor.permute(0, 2, 3, 1).reshape(B, N_verts, C)
 
+    # Per-vertex depth for gap fill (so we know rendered depth at each output pixel)
+    vertex_depth = normalized_depth.reshape(B, N_verts, 1)  # [B, H*W, 1]
+
     # --- Step 5: Rasterize each batch item with ModernGL ---
     ctx = _get_moderngl_context()
 
-    # Create shader program (reuse across batch items)
+    # Shader: pass position, color, and depth as vertex attributes
+    # Output color+depth to color texture, coverage flag to flag texture
     prog = ctx.program(
         vertex_shader='''
             #version 330
             in vec3 in_position;
             in vec3 in_color;
+            in float in_depth;
             out vec3 v_color;
+            out float v_depth;
             void main() {
                 gl_Position = vec4(in_position.xy, in_position.z, 1.0);
                 v_color = in_color;
+                v_depth = in_depth;
             }
         ''',
         fragment_shader='''
             #version 330
             in vec3 v_color;
+            in float v_depth;
             layout(location = 0) out vec4 fragColor;
             layout(location = 1) out float fragFlag;
             void main() {
-                fragColor = vec4(v_color, 1.0);
+                fragColor = vec4(v_color, v_depth);
                 fragFlag = 1.0;
             }
         ''',
@@ -595,22 +603,24 @@ def forward_warp_mesh(image_tensor, depth_tensor, divergence_px, separation_px,
     )
 
     results = []
+    depths = []
     masks = []
 
     for b in range(B):
-        # Build interleaved vertex data: [x, y, z, r, g, b] per vertex
+        # Build interleaved vertex data: [x, y, z, r, g, b, depth] per vertex
         positions = torch.stack([
             clip_x[b].reshape(-1),
             clip_y[b].reshape(-1),
             clip_z[b].reshape(-1),
         ], dim=1)  # [N_verts, 3]
         colors = vertex_colors[b]  # [N_verts, C]
+        vdepth = vertex_depth[b]   # [N_verts, 1]
 
-        vertex_data = torch.cat([positions, colors], dim=1)  # [N_verts, 6]
+        vertex_data = torch.cat([positions, colors, vdepth], dim=1)  # [N_verts, 7]
         vertex_np = vertex_data.cpu().numpy().astype(np.float32)
 
         vbo = ctx.buffer(vertex_np.tobytes())
-        vao = ctx.vertex_array(prog, [(vbo, '3f 3f', 'in_position', 'in_color')], ibo)
+        vao = ctx.vertex_array(prog, [(vbo, '3f 3f 1f', 'in_position', 'in_color', 'in_depth')], ibo)
 
         fbo.use()
         ctx.enable(moderngl.DEPTH_TEST)
@@ -626,8 +636,9 @@ def forward_warp_mesh(image_tensor, depth_tensor, divergence_px, separation_px,
         color_data = color_data[::-1].copy()
         flag_data = flag_data[::-1].copy()
 
-        results.append(color_data[:, :, :3])  # RGB only
-        masks.append(flag_data < 0.5)  # True = gap (unfilled)
+        results.append(color_data[:, :, :3])  # RGB
+        depths.append(color_data[:, :, 3])     # Rendered depth in alpha channel
+        masks.append(flag_data < 0.5)           # True = gap (unfilled)
 
         vbo.release()
         vao.release()
@@ -647,50 +658,33 @@ def forward_warp_mesh(image_tensor, depth_tensor, divergence_px, separation_px,
     warped = torch.from_numpy(warped_np).permute(0, 3, 1, 2).to(device)  # [B, C, H, W]
     gap_mask = torch.from_numpy(gap_mask_np).to(device)  # [B, H, W]
 
-    # --- Step 6: Gap fill — extend background border color into gaps ---
-    # In stereo, gaps at depth edges reveal background (the area behind the foreground).
-    # So we fill from the background side (lower depth = farther from camera).
-    # If only one border exists, use that.
+    # --- Step 6: Gap fill — smear from the correct side based on eye ---
+    # Left eye (divergence > 0): foreground shifts right, gaps on left → fill from left border
+    # Right eye (divergence < 0): foreground shifts left, gaps on right → fill from right border
     if gap_mask.any():
         filled_mask = ~gap_mask
         cols = torch.arange(W, device=device, dtype=torch.long).view(1, 1, W).expand(B, H, W)
 
-        # Nearest filled pixel on left
-        left_col = torch.where(filled_mask, cols, torch.full_like(cols, -1))
-        left_nearest, _ = torch.cummax(left_col, dim=2)
-        has_left = left_nearest >= 0
+        if divergence_px >= 0:
+            # Left eye: fill from the left (nearest filled pixel to the left)
+            fill_col = torch.where(filled_mask, cols, torch.full_like(cols, -1))
+            fill_nearest, _ = torch.cummax(fill_col, dim=2)
+        else:
+            # Right eye: fill from the right (nearest filled pixel to the right)
+            # Use cummin on flipped data: unfilled positions get W (large), cummin propagates
+            # the minimum column index from right to left
+            fill_col = torch.where(filled_mask, cols, torch.full_like(cols, W))
+            fill_col_flip = torch.flip(fill_col, [2])
+            fill_nearest_flip, _ = torch.cummin(fill_col_flip, dim=2)
+            fill_nearest = torch.flip(fill_nearest_flip, [2])
 
-        # Nearest filled pixel on right
-        right_col_flip = torch.where(
-            torch.flip(filled_mask, [2]),
-            torch.flip(cols, [2]),
-            torch.full_like(cols, -1)
-        )
-        right_nearest_flip, _ = torch.cummax(right_col_flip, dim=2)
-        right_nearest = torch.flip(right_nearest_flip, [2])
-        has_right = right_nearest >= 0
-
-        # Gather colors at borders
-        left_idx = left_nearest.clamp(0, W - 1).unsqueeze(1).expand_as(warped)
-        right_idx = right_nearest.clamp(0, W - 1).unsqueeze(1).expand_as(warped)
-        left_color = warped.gather(3, left_idx)
-        right_color = warped.gather(3, right_idx)
-
-        # Depth at borders — lower normalized_depth = farther = background
-        left_z = normalized_depth.gather(2, left_nearest.clamp(0, W - 1))
-        right_z = normalized_depth.gather(2, right_nearest.clamp(0, W - 1))
-
-        # Pick the background side (lower depth). If only one side exists, use it.
-        left_is_bg = left_z <= right_z
-        use_right = (has_right & ~has_left) | (has_left & has_right & ~left_is_bg)
-
-        # Default to left, override with right where appropriate
-        gap_fill = left_color  # [B, C, H, W]
-        use_right_4d = use_right.unsqueeze(1).expand_as(warped)
-        gap_fill = torch.where(use_right_4d, right_color, gap_fill)
+        has_fill = (fill_nearest >= 0) & (fill_nearest < W)
+        fill_idx = fill_nearest.clamp(0, W - 1).unsqueeze(1).expand_as(warped)
+        fill_color = warped.gather(3, fill_idx)
 
         gap_mask_4d = gap_mask.unsqueeze(1).expand_as(warped)
-        warped = torch.where(gap_mask_4d, gap_fill, warped)
+        has_fill_4d = has_fill.unsqueeze(1).expand_as(warped)
+        warped = torch.where(gap_mask_4d & has_fill_4d, fill_color, warped)
 
     return warped, gap_mask
 

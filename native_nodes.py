@@ -45,10 +45,10 @@ class NativeStereoImageViewer:
                 "swap_eyes": ("BOOLEAN", {"default": False}),
                 "auto_launch": ("BOOLEAN", {"default": True}),
                 "background_color": (["Black", "Dark Gray", "Gray", "White"],),
-            },
-            "optional": {
-                "right_image": ("IMAGE",),
-            }
+            }#,
+            #"optional": {
+            #    "right_image": ("IMAGE",),
+            #}
         }
 
     RETURN_TYPES = ("IMAGE",)

@@ -6,6 +6,7 @@ opencv-python
 numba
 scipy
 psutil
+moderngl
 
 # Native VR Viewer Dependencies (PyOpenXR)
 # For native VR viewing with auto-launch to headset
