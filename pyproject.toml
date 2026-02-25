@@ -1,7 +1,7 @@
 [project]
 name = "comfystereo"
 description = "Stereoscopic 3D toolkit for ComfyUI combining depth-based stereo generation with GPU acceleration, native VR viewing via PyOpenXR, and AI-powered StereoDiffusion. Supports 6+ nodes for stereo conversion, VR headset viewing, and diffusion model stereo generation."
-version = "2.0.1"
+version = "2.0.2"
 license = {file = "LICENSE"}
 dependencies = ["torch", "numpy", "Pillow", "opencv-python", "numba", "scipy", "psutil"]
 
