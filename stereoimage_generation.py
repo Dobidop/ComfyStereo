@@ -9,7 +9,7 @@ except Exception as e:
 import numpy as np
 from PIL import Image
 import math
-from scipy.ndimage import convolve1d, binary_dilation, sobel
+from scipy.ndimage import convolve1d, sobel
 import torch
 import torch.nn.functional as F
 
@@ -1005,7 +1005,8 @@ def apply_stereo_divergence_gpu_with_fill(image_tensor, depth_tensor, divergence
 def create_stereoimages_gpu(image_tensor, depth_tensor, divergence, separation=0.0, modes=None,
                             stereo_balance=0.0, stereo_offset_exponent=1.0, convergence_point=0.5,
                             depth_blur_strength=0.0, depth_blur_edge_threshold=6.0,
-                            direction_aware_depth_blur=False):
+                            direction_aware_depth_blur=False, depth_blur_falloff=1.0,
+                            depth_blur_vert_smooth=0):
     """
     Fully GPU-accelerated stereo image generation with batch support.
 
@@ -1048,7 +1049,8 @@ def create_stereoimages_gpu(image_tensor, depth_tensor, divergence, separation=0
     # directional_motion_blur_gpu handles [B, H, W] via its internal 4D reshape
     if direction_aware_depth_blur and depth_blur_strength > 0:
         left_depth, right_depth = directional_motion_blur_gpu(
-            depth_tensor, depth_blur_strength, depth_blur_edge_threshold, depth_blur_strength
+            depth_tensor, depth_blur_strength, depth_blur_edge_threshold, depth_blur_strength,
+            falloff_exponent=depth_blur_falloff, vert_smooth_px=depth_blur_vert_smooth
         )
     else:
         left_depth = depth_tensor
@@ -1126,15 +1128,64 @@ def create_stereoimages_gpu(image_tensor, depth_tensor, divergence, separation=0
     return results, left_depth_out, right_depth_out, combined_mask
 
 
-def directional_motion_blur_gpu(depth_tensor, blur_strength, edge_threshold, blur_mask_width=5):
+def _edge_distance_weight_gpu(edge_mask, mask_radius, falloff_exponent, device):
+    """
+    Compute smooth blend weights from a binary edge mask using a nearest-edge distance
+    transform (cummax scan). For each pixel:
+        weight = (1 - dist/mask_radius)^falloff_exponent
+    where dist is the horizontal distance to the nearest edge pixel in the same row.
+
+    Unlike a convolution approach, this guarantees falloff_exponent has a meaningful
+    effect even along a continuous edge — the weight spans the full [0,1] range in the
+    transition zone rather than saturating to 1 everywhere.
+
+    edge_mask : bool tensor [B, 1, H, W]
+    Returns  : float tensor [B, 1, H, W] with values in [0, 1]
+    """
+    B, _, H, W = edge_mask.shape
+    cols = torch.arange(W, device=device, dtype=torch.float32).view(1, 1, 1, W)
+    large = float(mask_radius + 1)
+
+    # Distance to nearest edge to the LEFT (0 at the edge pixel, +1 per step right)
+    col_left = torch.where(edge_mask,
+                           cols.expand(B, 1, H, W),
+                           torch.full((B, 1, H, W), -1.0, device=device))
+    last_edge_left, _ = torch.cummax(col_left, dim=3)
+    dist_from_left = torch.where(last_edge_left >= 0,
+                                 cols.expand(B, 1, H, W) - last_edge_left,
+                                 torch.full((B, 1, H, W), large, device=device))
+
+    # Distance to nearest edge to the RIGHT — flip columns, same scan, flip back
+    col_right = torch.where(edge_mask.flip(3),
+                            cols.expand(B, 1, H, W),
+                            torch.full((B, 1, H, W), -1.0, device=device))
+    last_edge_right, _ = torch.cummax(col_right, dim=3)
+    dist_from_right = torch.where(last_edge_right >= 0,
+                                  cols.expand(B, 1, H, W) - last_edge_right,
+                                  torch.full((B, 1, H, W), large, device=device)).flip(3)
+
+    dist = torch.minimum(dist_from_left, dist_from_right)
+    return (1.0 - dist / mask_radius).clamp(0.0, 1.0) ** falloff_exponent
+
+
+def directional_motion_blur_gpu(depth_tensor, blur_strength, edge_threshold, blur_mask_width=5,
+                                 falloff_exponent=1.0, vert_smooth_px=0):
     """
     GPU-accelerated directional motion blur for depth maps using PyTorch.
 
     Parameters:
-        depth_tensor (torch.Tensor): Input depth map [H, W] or [1, 1, H, W]
-        blur_strength (float): Width of the blur
+        depth_tensor (torch.Tensor): Input depth map [H, W] or [B, H, W]
+        blur_strength (float): Width of the blur kernel in pixels
         edge_threshold (float): Edge detection threshold
-        blur_mask_width (float): How wide the mask should be
+        blur_mask_width (float): Max distance (px) the blur influence spreads from an edge.
+            Lower values protect thin objects and reduce bleed between nearby objects.
+        falloff_exponent (float): Shapes the blend weight decay with distance from edges.
+            1.0 = linear (default), >1.0 = blur concentrated tight to edges,
+            <1.0 = wide gentle falloff.
+        vert_smooth_px (int): Vertical smoothing radius applied to the weight maps after
+            horizontal computation. Blends weight values across adjacent rows, eliminating
+            horizontal stripe artifacts caused by rows whose gradients straddle the
+            edge_threshold. 0 = off (default), 3-7 = typical useful range.
 
     Returns:
         left_blurred (torch.Tensor): Depth map modified for the left eye
@@ -1146,72 +1197,56 @@ def directional_motion_blur_gpu(depth_tensor, blur_strength, edge_threshold, blu
     device = _get_device(depth_tensor)
     depth_tensor = depth_tensor.to(device)
 
-    # Track original dims to restore on output
     input_ndim = depth_tensor.dim()
 
     # Ensure 4D tensor [B, 1, H, W]
     if depth_tensor.dim() == 2:
-        depth_tensor = depth_tensor.unsqueeze(0).unsqueeze(0)  # [H,W] -> [1,1,H,W]
+        depth_tensor = depth_tensor.unsqueeze(0).unsqueeze(0)
     elif depth_tensor.dim() == 3:
-        depth_tensor = depth_tensor.unsqueeze(1)  # [B,H,W] -> [B,1,H,W]
+        depth_tensor = depth_tensor.unsqueeze(1)
 
     blur_strength = int(round(blur_strength))
+    mask_radius = int(blur_mask_width)
+    B, _, H, W = depth_tensor.shape
 
-    # Compute horizontal gradient using Sobel filtering
+    # Horizontal gradient via Sobel
     sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
                            dtype=depth_tensor.dtype, device=device).unsqueeze(0).unsqueeze(0)
     grad_x = F.conv2d(depth_tensor, sobel_x, padding=1)
 
-    # Compute edge strength
-    edge_strength = torch.abs(grad_x) / (10 * edge_threshold)
-    edge_strength = torch.clamp(edge_strength, 0, 1)
+    edge_str = torch.abs(grad_x) / (10 * edge_threshold)
+    edge_str = torch.clamp(edge_str, 0, 1)
+    left_edge_mask  = (grad_x > 0) & (edge_str > 0.5)
+    right_edge_mask = (grad_x < 0) & (edge_str > 0.5)
 
-    # Create separate edge masks
-    left_edge_mask = (grad_x > 0) & (edge_strength > 0.5)
-    right_edge_mask = (grad_x < 0) & (edge_strength > 0.5)
+    # Distance-based weights: 1.0 at edge pixels, decays to 0 at mask_radius distance.
+    # falloff_exponent shapes the curve within that range.
+    left_weight  = _edge_distance_weight_gpu(left_edge_mask,  mask_radius, falloff_exponent, device)
+    right_weight = _edge_distance_weight_gpu(right_edge_mask, mask_radius, falloff_exponent, device)
 
-    # Dilation for mask expansion
-    mask_radius = int(blur_mask_width)
-    dilation_kernel = torch.ones((1, 1, 1, mask_radius), dtype=torch.float32, device=device)
+    # Optional vertical smoothing: blends weight values across adjacent rows to eliminate
+    # horizontal stripe artifacts from rows straddling the edge_threshold.
+    if vert_smooth_px > 0:
+        vert_size = 2 * vert_smooth_px + 1
+        vk = torch.ones((1, 1, vert_size, 1), device=device, dtype=depth_tensor.dtype) / vert_size
+        left_weight  = F.conv2d(left_weight,  vk, padding=(vert_smooth_px, 0))[..., :H, :]
+        right_weight = F.conv2d(right_weight, vk, padding=(vert_smooth_px, 0))[..., :H, :]
 
-    # Apply dilation (approximate with max pooling)
-    # Ensure output size matches input by cropping if needed
-    left_dilated_mask = F.max_pool2d(left_edge_mask.float(),
-                                      kernel_size=(1, mask_radius),
-                                      stride=1,
-                                      padding=(0, mask_radius//2)) > 0.5
-    right_dilated_mask = F.max_pool2d(right_edge_mask.float(),
-                                       kernel_size=(1, mask_radius),
-                                       stride=1,
-                                       padding=(0, mask_radius//2)) > 0.5
-
-    # Create horizontal motion blur kernel
+    # Motion blur kernels (box filters in left and right directions)
     blur_kernel = torch.ones((1, 1, 1, blur_strength), device=device) / blur_strength
-
-    # Apply motion blur
-    blurred_depth_left = F.conv2d(depth_tensor, blur_kernel, padding=(0, blur_strength//2))
+    blurred_depth_left  = F.conv2d(depth_tensor, blur_kernel,                  padding=(0, blur_strength//2))
     blurred_depth_right = F.conv2d(depth_tensor, torch.flip(blur_kernel, [3]), padding=(0, blur_strength//2))
+    blurred_depth_left  = blurred_depth_left [..., :H, :W]
+    blurred_depth_right = blurred_depth_right[..., :H, :W]
 
-    # Ensure all tensors have the same size by cropping to the smallest dimension
-    target_shape = depth_tensor.shape
-    left_dilated_mask = left_dilated_mask[..., :target_shape[2], :target_shape[3]]
-    right_dilated_mask = right_dilated_mask[..., :target_shape[2], :target_shape[3]]
-    blurred_depth_left = blurred_depth_left[..., :target_shape[2], :target_shape[3]]
-    blurred_depth_right = blurred_depth_right[..., :target_shape[2], :target_shape[3]]
+    # Smooth blend: full blur at edges, original depth outside the falloff zone
+    left_blurred  = left_weight  * blurred_depth_left  + (1.0 - left_weight)  * depth_tensor
+    right_blurred = right_weight * blurred_depth_right + (1.0 - right_weight) * depth_tensor
 
-    # Initialize output
-    left_blurred = depth_tensor.clone()
-    right_blurred = depth_tensor.clone()
-
-    # Apply blur only in masked regions
-    left_blurred = torch.where(left_dilated_mask, blurred_depth_left, left_blurred)
-    right_blurred = torch.where(right_dilated_mask, blurred_depth_right, right_blurred)
-
-    # Restore original shape: [H,W] if input was 2D, [B,H,W] if input was 3D
-    left_out = left_blurred.squeeze(1)   # remove channel dim -> [B, H, W]
+    left_out  = left_blurred.squeeze(1)
     right_out = right_blurred.squeeze(1)
     if input_ndim == 2:
-        left_out = left_out.squeeze(0)   # remove batch dim -> [H, W]
+        left_out  = left_out.squeeze(0)
         right_out = right_out.squeeze(0)
     return left_out, right_out
 
@@ -1308,75 +1343,87 @@ def right_direction_aware_blur_depth_map(depth, sigma, edge_threshold):
     blurred = blur_depth_map(depth, sigma)
     return (1.0 - weight) * depth + weight * blurred
 
-def directional_motion_blur(depth, blur_strength, edge_threshold, blur_mask_width=5):
+def directional_motion_blur(depth, blur_strength, edge_threshold, blur_mask_width=5,
+                            falloff_exponent=1.0, vert_smooth_px=0):
     """
     Applies directional motion blur to depth map edges instead of Gaussian blur.
-    
-    - Generates separate masks for left and right eye depth adjustments.
-    - Applies **horizontal motion blur** only within the masked regions.
-    - Ensures blur extends in the correct direction for better stereo depth.
-    - Uses **Sobel filtering** for better edge detection.
-    
+
+    - Generates separate weight maps for left and right eye depth adjustments.
+    - Applies horizontal motion blur blended by a smooth spatial weight (distance transform).
+    - Uses Sobel filtering for edge detection.
+
     Parameters:
-        depth (ndarray): Input depth map
-        blur_strength (float): Generally, the width of the blur
-        edge_threshold (float): Edge detection threshold (used adaptively)
-        blur_mask_width (float): How wide the mask should be
-    
+        depth (ndarray): Input depth map [H, W]
+        blur_strength (float): Width of the blur kernel in pixels
+        edge_threshold (float): Edge detection threshold
+        blur_mask_width (float): Max distance (px) the blur influence spreads from an edge.
+        falloff_exponent (float): Shapes the blend weight decay. 1.0 = linear (default),
+            >1.0 = concentrated near edges, <1.0 = wide gentle falloff.
+        vert_smooth_px (int): Vertical smoothing radius applied to weight maps to eliminate
+            horizontal stripe artifacts. 0 = off (default), 3-7 = typical range.
+
     Returns:
         left_blurred (ndarray): Depth map modified for the left eye
         right_blurred (ndarray): Depth map modified for the right eye
     """
     if blur_strength <= 0:
-        return depth, depth  # No modification needed
-    
-    blur_strength = int(round(blur_strength))  # Ensure blur length is an integer
-    
-    h, w = depth.shape
-    
-    # Compute horizontal gradient using Sobel filtering for better edge detection
-    grad_x = sobel(depth, axis=1)
-    
-    # Compute edge strength using fixed threshold
-    edge_strength = np.abs(grad_x) / (10*edge_threshold)
-    edge_strength = np.clip(edge_strength, 0, 1)
-    
-    # Create separate edge masks
-    left_edge_mask = (grad_x > 0) & (edge_strength > 0.5)  # Left eye: Positive gradients
-    right_edge_mask = (grad_x < 0) & (edge_strength > 0.5)  # Right eye: Negative gradients
-    
-    # Define mask expansion width separately from blur strength
-    mask_radius = int(blur_mask_width)
-    
-    # Create directional dilation structures for better blending
-    struct_right = np.ones((1, mask_radius), dtype=bool)  # Dilation extends rightward
-    struct_left = np.ones((1, mask_radius), dtype=bool)   # Dilation extends leftward
-    
-    # Apply directional dilation
-    left_dilated_mask = binary_dilation(left_edge_mask, struct_right)
-    right_dilated_mask = binary_dilation(right_edge_mask, struct_left)
+        return depth, depth
 
-    # Create a horizontal motion blur kernel
-    blur_kernel = np.ones(blur_strength) / (blur_strength)
-    
-    # Initialize output depth maps
-    left_blurred = depth.copy()
-    right_blurred = depth.copy()
-    
-    # Apply **motion blur only within the masked region**
-    blurred_depth_left = convolve1d(depth, blur_kernel, axis=1, mode='nearest')
-    blurred_depth_right = convolve1d(depth, blur_kernel[::-1], axis=1, mode='nearest')
-    
-    left_blurred[left_dilated_mask] = blurred_depth_left[left_dilated_mask]
-    right_blurred[right_dilated_mask] = blurred_depth_right[right_dilated_mask]
-    
+    blur_strength = int(round(blur_strength))
+    mask_radius = int(blur_mask_width)
+    h, w = depth.shape
+
+    # Horizontal gradient via Sobel
+    grad_x = sobel(depth, axis=1)
+
+    edge_str = np.abs(grad_x) / (10 * edge_threshold)
+    edge_str = np.clip(edge_str, 0, 1)
+    left_edge_mask  = (grad_x > 0) & (edge_str > 0.5)
+    right_edge_mask = (grad_x < 0) & (edge_str > 0.5)
+
+    # Distance-based smooth weights using vectorized cummax (np.maximum.accumulate).
+    # For each row: distance to nearest edge pixel left/right, then take minimum.
+    cols = np.arange(w, dtype=np.float32)
+    large = float(mask_radius + 1)
+
+    def _dist_weight(mask):
+        # Left distance
+        col_l = np.where(mask, np.broadcast_to(cols, (h, w)), -1.0)
+        last_l = np.maximum.accumulate(col_l, axis=1)
+        dist_l = np.where(last_l >= 0, cols[np.newaxis, :] - last_l, large)
+        # Right distance (flip trick)
+        col_r = np.where(mask[:, ::-1], np.broadcast_to(cols, (h, w)), -1.0)
+        last_r = np.maximum.accumulate(col_r, axis=1)
+        dist_r_flip = np.where(last_r >= 0, cols[np.newaxis, :] - last_r, large)
+        dist_r = dist_r_flip[:, ::-1]
+        dist = np.minimum(dist_l, dist_r)
+        return np.clip(1.0 - dist / mask_radius, 0.0, 1.0) ** falloff_exponent
+
+    left_weight  = _dist_weight(left_edge_mask)
+    right_weight = _dist_weight(right_edge_mask)
+
+    # Optional vertical smoothing: blend weight values across rows to eliminate stripes
+    if vert_smooth_px > 0:
+        vert_kernel = np.ones(2 * vert_smooth_px + 1) / (2 * vert_smooth_px + 1)
+        left_weight  = np.clip(convolve1d(left_weight,  vert_kernel, axis=0, mode='nearest'), 0.0, 1.0)
+        right_weight = np.clip(convolve1d(right_weight, vert_kernel, axis=0, mode='nearest'), 0.0, 1.0)
+
+    # Apply motion blur across the whole depth map, then blend by distance weight
+    blur_kernel = np.ones(blur_strength) / blur_strength
+    blurred_depth_left  = convolve1d(depth, blur_kernel,        axis=1, mode='nearest')
+    blurred_depth_right = convolve1d(depth, blur_kernel[::-1],  axis=1, mode='nearest')
+
+    left_blurred  = left_weight  * blurred_depth_left  + (1.0 - left_weight)  * depth
+    right_blurred = right_weight * blurred_depth_right + (1.0 - right_weight) * depth
+
     return left_blurred, right_blurred
 
 
 def create_stereoimages(original_image, depthmap, divergence, separation=0.0, modes=None,
                         stereo_balance=0.0, stereo_offset_exponent=1.0, fill_technique='polylines_sharp',
                         depth_blur_strength=0.0, depth_blur_edge_threshold=6.0,
-                        direction_aware_depth_blur=False, return_modified_depth=True, convergence_point=0.5):
+                        direction_aware_depth_blur=False, return_modified_depth=True, convergence_point=0.5,
+                        depth_blur_falloff=1.0, depth_blur_vert_smooth=0):
                             
     """
     Creates stereoscopic images.
@@ -1430,7 +1477,8 @@ def create_stereoimages(original_image, depthmap, divergence, separation=0.0, mo
 
         if direction_aware_depth_blur:
             left_depthmap, right_depthmap = directional_motion_blur_gpu(
-                depthmap, depth_blur_strength, depth_blur_edge_threshold, depth_blur_strength
+                depthmap, depth_blur_strength, depth_blur_edge_threshold, depth_blur_strength,
+                falloff_exponent=depth_blur_falloff, vert_smooth_px=depth_blur_vert_smooth
             )
         else:
             left_depthmap = right_depthmap = depthmap
@@ -1441,7 +1489,8 @@ def create_stereoimages(original_image, depthmap, divergence, separation=0.0, mo
 
         if direction_aware_depth_blur:
             left_depthmap, right_depthmap = directional_motion_blur(
-                depthmap, depth_blur_strength, depth_blur_edge_threshold, depth_blur_strength
+                depthmap, depth_blur_strength, depth_blur_edge_threshold, depth_blur_strength,
+                falloff_exponent=depth_blur_falloff, vert_smooth_px=depth_blur_vert_smooth
             )
         else:
             left_depthmap = right_depthmap = depthmap
