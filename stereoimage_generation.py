@@ -654,35 +654,114 @@ def forward_warp_mesh(image_tensor, depth_tensor, divergence_px, separation_px,
     # Convert results back to torch tensors
     warped_np = np.stack(results, axis=0)  # [B, H, W, 3]
     gap_mask_np = np.stack(masks, axis=0)  # [B, H, W]
+    rendered_depth_np = np.stack(depths, axis=0)  # [B, H, W] — fg=high, bg=low (normalized)
 
     warped = torch.from_numpy(warped_np).permute(0, 3, 1, 2).to(device)  # [B, C, H, W]
     gap_mask = torch.from_numpy(gap_mask_np).to(device)  # [B, H, W]
+    rendered_depth = torch.from_numpy(rendered_depth_np).to(device)  # [B, H, W]
 
-    # --- Step 6: Gap fill — smear from the correct side based on eye ---
-    # Left eye (divergence > 0): foreground shifts right, gaps on left → fill from left border
-    # Right eye (divergence < 0): foreground shifts left, gaps on right → fill from right border
-    if gap_mask.any():
-        filled_mask = ~gap_mask
+    # --- Step 6: Depth-aware gap fill ---
+    # Smear from the correct side based on eye, but prefer source pixels with
+    # background-like depth. Otherwise the cummax-nearest-filled-pixel heuristic
+    # picks the trailing edge of a nearby foreground object (e.g. another hair
+    # strand across the disocclusion) and smears foreground color into what
+    # should be background, since the actual bg source for the disocclusion lies
+    # further away across that foreground.
+    #
+    # Logic: cummax twice — once over "filled & depth-below-threshold" (preferred
+    # bg source), once over plain "filled" (fallback). Use the bg-restricted
+    # source where one exists in the row, fall back to nearest-filled otherwise.
+    # The fallback preserves prior behavior in rows where the depth-restricted
+    # search finds nothing (e.g. frame edges, all-foreground rows).
+    # Extend the gap mask to include "soft gap" transition pixels next to real gaps.
+    # Kept stretched-mesh triangles at the fg edge (cells whose offset gradient
+    # squeaks under gradient_threshold) render barycentric-interpolated color and
+    # mid-range rendered_depth. These look like a thin "translated copy" of the
+    # fg edge in the disocclusion zone. Treating them as gap and filling from bg
+    # cleans up that ghost edge without touching legitimate fg-bg interface
+    # content far from any gap. The original gap_mask is preserved for the
+    # return value (so the node's MASK output still reflects only rasterizer-
+    # uncovered pixels); only the local effective_gap_mask used by fill logic
+    # is extended.
+    transition_mask = (~gap_mask) & (rendered_depth >= 0.5) & (rendered_depth < 0.8)
+    transition_dilation_px = 4
+    gap_dilated_f = F.max_pool2d(
+        gap_mask.float().unsqueeze(1),
+        (1, 2 * transition_dilation_px + 1),
+        stride=1,
+        padding=(0, transition_dilation_px),
+    ).squeeze(1)
+    near_gap = gap_dilated_f > 0.5
+    effective_gap_mask = gap_mask | (transition_mask & near_gap)
+
+    if effective_gap_mask.any():
+        filled_mask = ~effective_gap_mask
+        # Anything below this normalized-depth value is considered bg-eligible
+        # for fill. 0 = far/bg, 1 = near/fg. 0.5 splits at the depth midpoint.
+        fill_depth_threshold = 0.5
+        bg_eligible = filled_mask & (rendered_depth < fill_depth_threshold)
+
+        # Cap how far the gap-fill is allowed to reach for a bg source. If no
+        # bg-eligible pixel exists within this range, fall back to the original
+        # nearest-filled behavior. Without this cap, sparse-bg rows (mostly-fg
+        # scenes) end up sourcing from whichever true-bg pixel happens to exist
+        # in the row — typically near the frame edge, producing visible smears
+        # across half the image.
+        max_fill_dist = max(int(abs(divergence_px) * 1.5), 40)
+
+        # Step further into the bg, away from the edge transition zone, before
+        # sampling color. Pixels right at the fg/bg boundary often have bg-like
+        # rendered_depth but fg-tinted color (from barycentric interpolation in
+        # kept stretched-mesh triangles, and from OpenGL edge anti-aliasing).
+        # Sampling a few pixels deeper into the bg skips this transition zone
+        # and produces cleaner fill colors.
+        edge_setback = 3
+
         cols = torch.arange(W, device=device, dtype=torch.long).view(1, 1, W).expand(B, H, W)
 
         if divergence_px >= 0:
-            # Left eye: fill from the left (nearest filled pixel to the left)
-            fill_col = torch.where(filled_mask, cols, torch.full_like(cols, -1))
+            # Left eye: search to the LEFT — cummax over column index with sentinel = -1
+            bg_col       = torch.where(bg_eligible, cols, torch.full_like(cols, -1))
+            fill_col     = torch.where(filled_mask, cols, torch.full_like(cols, -1))
+            bg_nearest,   _ = torch.cummax(bg_col,   dim=2)
             fill_nearest, _ = torch.cummax(fill_col, dim=2)
+            bg_dist       = cols - bg_nearest
+            bg_has        = bg_nearest   >= 0
+            fill_has      = fill_nearest >= 0
+            bg_sample_col = (bg_nearest - edge_setback).clamp(min=0)
         else:
-            # Right eye: fill from the right (nearest filled pixel to the right)
-            # Use cummin on flipped data: unfilled positions get W (large), cummin propagates
-            # the minimum column index from right to left
-            fill_col = torch.where(filled_mask, cols, torch.full_like(cols, W))
-            fill_col_flip = torch.flip(fill_col, [2])
-            fill_nearest_flip, _ = torch.cummin(fill_col_flip, dim=2)
+            # Right eye: search to the RIGHT — cummin on flipped cols with sentinel = W
+            # (mirrors the proven pattern from the original fallback code)
+            bg_col       = torch.where(bg_eligible, cols, torch.full_like(cols, W))
+            fill_col     = torch.where(filled_mask, cols, torch.full_like(cols, W))
+            bg_nearest_flip,   _ = torch.cummin(torch.flip(bg_col,   [2]), dim=2)
+            fill_nearest_flip, _ = torch.cummin(torch.flip(fill_col, [2]), dim=2)
+            bg_nearest   = torch.flip(bg_nearest_flip,   [2])
             fill_nearest = torch.flip(fill_nearest_flip, [2])
+            bg_dist       = bg_nearest - cols
+            bg_has        = bg_nearest   < W
+            fill_has      = fill_nearest < W
+            bg_sample_col = (bg_nearest + edge_setback).clamp(max=W - 1)
 
-        has_fill = (fill_nearest >= 0) & (fill_nearest < W)
-        fill_idx = fill_nearest.clamp(0, W - 1).unsqueeze(1).expand_as(warped)
+        # Safety: verify the stepped-back column is actually bg-eligible. If the
+        # setback overshot into another gap (→ would gather black-cleared pixels)
+        # or into a foreground pixel (→ would smear fg as if it were bg), fall
+        # back to bg_nearest itself for that pixel. bg_nearest is guaranteed
+        # bg-eligible since it came from the cummax/cummin over bg_eligible.
+        bg_nearest_clamped = bg_nearest.clamp(min=0, max=W - 1)
+        sample_is_bg = bg_eligible.gather(2, bg_sample_col)
+        bg_sample_col = torch.where(sample_is_bg, bg_sample_col, bg_nearest_clamped)
+
+        # Use the bg sample (stepped back from the edge, with safety fallback) if
+        # present and within reach; otherwise fall back to nearest-filled.
+        use_bg         = bg_has & (bg_dist <= max_fill_dist)
+        chosen_nearest = torch.where(use_bg, bg_sample_col, fill_nearest)
+        has_fill       = use_bg | fill_has
+
+        fill_idx = chosen_nearest.clamp(0, W - 1).unsqueeze(1).expand_as(warped)
         fill_color = warped.gather(3, fill_idx)
 
-        gap_mask_4d = gap_mask.unsqueeze(1).expand_as(warped)
+        gap_mask_4d = effective_gap_mask.unsqueeze(1).expand_as(warped)
         has_fill_4d = has_fill.unsqueeze(1).expand_as(warped)
         warped = torch.where(gap_mask_4d & has_fill_4d, fill_color, warped)
 
@@ -1051,7 +1130,7 @@ def create_stereoimages_gpu(image_tensor, depth_tensor, divergence, separation=0
     if direction_aware_depth_blur and depth_blur_strength > 0:
         left_depth, right_depth = directional_motion_blur_gpu(
             depth_tensor, depth_blur_strength, depth_blur_edge_threshold, depth_blur_strength,
-            falloff_exponent=depth_blur_falloff, vert_smooth_px=depth_blur_vert_smooth
+            falloff_exponent=depth_blur_falloff, vert_smooth_px=depth_blur_vert_smooth,
         )
     else:
         left_depth = depth_tensor
@@ -1204,14 +1283,23 @@ def _edge_distance_weight_gpu(edge_mask, mask_radius, falloff_exponent, device):
 def directional_motion_blur_gpu(depth_tensor, blur_strength, edge_threshold, blur_mask_width=5,
                                  falloff_exponent=1.0, vert_smooth_px=0):
     """
-    GPU-accelerated directional motion blur for depth maps using PyTorch.
+    GPU-accelerated edge-aware depth blur using PyTorch.
+
+    The blur kernel at each pixel adapts its reach to the local depth-edge geometry:
+    it averages depth values over a window that extends outward from the pixel until
+    it hits another strong depth edge on each side, capped at blur_strength/2. This
+    prevents the blur from pulling in depth values from across opposing edges, which
+    would (a) erode thin foreground objects (by averaging fg depth with bg from the
+    far side) and (b) contaminate one side of a small gap with depth from the other
+    (e.g. a donut hole — bg blurred into the hole's interior leaks across to the
+    opposite fg edge of the ring).
 
     Parameters:
         depth_tensor (torch.Tensor): Input depth map [H, W] or [B, H, W]
-        blur_strength (float): Width of the blur kernel in pixels
+        blur_strength (float): Maximum width of the blur kernel in pixels
         edge_threshold (float): Edge detection threshold
-        blur_mask_width (float): Max distance (px) the blur influence spreads from an edge.
-            Lower values protect thin objects and reduce bleed between nearby objects.
+        blur_mask_width (float): Max distance (px) the blur influence spreads from an edge
+            via the per-eye blend weight. Lower values keep the blur tight to edges.
         falloff_exponent (float): Shapes the blend weight decay with distance from edges.
             1.0 = linear (default), >1.0 = blur concentrated tight to edges,
             <1.0 = wide gentle falloff.
@@ -1265,16 +1353,58 @@ def directional_motion_blur_gpu(depth_tensor, blur_strength, edge_threshold, blu
         left_weight  = F.conv2d(left_weight,  vk, padding=(vert_smooth_px, 0))[..., :H, :]
         right_weight = F.conv2d(right_weight, vk, padding=(vert_smooth_px, 0))[..., :H, :]
 
-    # Motion blur kernels (box filters in left and right directions)
-    blur_kernel = torch.ones((1, 1, 1, blur_strength), device=device) / blur_strength
-    blurred_depth_left  = F.conv2d(depth_tensor, blur_kernel,                  padding=(0, blur_strength//2))
-    blurred_depth_right = F.conv2d(depth_tensor, torch.flip(blur_kernel, [3]), padding=(0, blur_strength//2))
-    blurred_depth_left  = blurred_depth_left [..., :H, :W]
-    blurred_depth_right = blurred_depth_right[..., :H, :W]
+    # --- Edge-aware blur ---
+    # At each pixel, the blur averages depth values over a window that extends outward
+    # in each direction until it reaches another strong depth edge or hits blur_strength/2,
+    # whichever comes first. This replaces the symmetric box blur and removes the need for
+    # any width-based protection: the kernel auto-shrinks at thin features and small gaps,
+    # and reaches normally on wide silhouettes. Computed via cummax-on-edge-mask for the
+    # per-pixel reaches and a prefix-sum (cumsum) for the windowed mean.
+    half = blur_strength // 2
+    any_edge = left_edge_mask | right_edge_mask  # [B, 1, H, W]
 
-    # Smooth blend: full blur at edges, original depth outside the falloff zone
-    left_blurred  = left_weight  * blurred_depth_left  + (1.0 - left_weight)  * depth_tensor
-    right_blurred = right_weight * blurred_depth_right + (1.0 - right_weight) * depth_tensor
+    cols_4d = torch.arange(W, device=device, dtype=torch.long).view(1, 1, 1, W).expand_as(any_edge)
+
+    # Distance to nearest edge strictly LEFT of each column.
+    # Shift cummax input right by one so col p sees only cols 0..p-1.
+    col_idx = torch.where(any_edge, cols_4d, torch.full_like(cols_4d, -1))
+    col_idx_shifted = F.pad(col_idx[..., :-1], (1, 0), value=-1)
+    nearest_left, _ = torch.cummax(col_idx_shifted, dim=-1)
+    left_dist = torch.where(
+        nearest_left >= 0,
+        cols_4d - nearest_left,
+        torch.full_like(cols_4d, half + 1),  # no edge to the left → use full reach
+    )
+
+    # Distance to nearest edge strictly RIGHT of each column.
+    # Same operation on the flipped array, then flip the result back.
+    any_edge_flip = any_edge.flip(-1)
+    col_idx_flip = torch.where(any_edge_flip, cols_4d, torch.full_like(cols_4d, -1))
+    col_idx_flip_shifted = F.pad(col_idx_flip[..., :-1], (1, 0), value=-1)
+    nearest_left_flip, _ = torch.cummax(col_idx_flip_shifted, dim=-1)
+    right_dist_flip = torch.where(
+        nearest_left_flip >= 0,
+        cols_4d - nearest_left_flip,
+        torch.full_like(cols_4d, half + 1),
+    )
+    right_dist = right_dist_flip.flip(-1)
+
+    left_reach  = left_dist.clamp(min=0, max=half)
+    right_reach = right_dist.clamp(min=0, max=half)
+
+    # Windowed mean via prefix sum: sum[a..b] = cumsum_padded[b+1] - cumsum_padded[a]
+    depth_cumsum = torch.cumsum(depth_tensor, dim=-1)
+    depth_cumsum_padded = F.pad(depth_cumsum, (1, 0))  # [B, 1, H, W+1]
+
+    a = (cols_4d - left_reach).clamp(min=0)
+    b = (cols_4d + right_reach).clamp(max=W - 1)
+    window_sum = depth_cumsum_padded.gather(-1, b + 1) - depth_cumsum_padded.gather(-1, a)
+    window_count = (b - a + 1).to(depth_tensor.dtype)
+    edge_aware_blur = window_sum / window_count.clamp(min=1)
+
+    # Standard blend: full blur near edges, original depth in the body of features.
+    left_blurred  = left_weight  * edge_aware_blur + (1.0 - left_weight)  * depth_tensor
+    right_blurred = right_weight * edge_aware_blur + (1.0 - right_weight) * depth_tensor
 
     left_out  = left_blurred.squeeze(1)
     right_out = right_blurred.squeeze(1)

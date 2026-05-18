@@ -157,7 +157,7 @@ class StereoImageNode:
                     depth_blur_falloff=depth_blur_falloff,
                     depth_blur_vert_smooth=depth_blur_vert_smooth,
                     skip_flat_depth=skip_flat_depth,
-                    flat_depth_threshold=flat_depth_threshold
+                    flat_depth_threshold=flat_depth_threshold,
                 )
 
                 # Convert results [B, C, H, W] -> ComfyUI [B, H, W, C] on CPU
