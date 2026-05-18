@@ -1006,7 +1006,8 @@ def create_stereoimages_gpu(image_tensor, depth_tensor, divergence, separation=0
                             stereo_balance=0.0, stereo_offset_exponent=1.0, convergence_point=0.5,
                             depth_blur_strength=0.0, depth_blur_edge_threshold=6.0,
                             direction_aware_depth_blur=False, depth_blur_falloff=1.0,
-                            depth_blur_vert_smooth=0):
+                            depth_blur_vert_smooth=0, skip_flat_depth=False,
+                            flat_depth_threshold=1.5):
     """
     Fully GPU-accelerated stereo image generation with batch support.
 
@@ -1070,22 +1071,54 @@ def create_stereoimages_gpu(image_tensor, depth_tensor, divergence, separation=0
     else:
         warp_fn = forward_warp_gpu
 
-    left_mask = torch.zeros(B, H, W, dtype=torch.bool, device=device)
+    # Flat-depth early exit: if every frame in the batch has a depth map that is both
+    # gradient-free and produces negligible pixel displacement, skip the expensive warp
+    # entirely and duplicate the original image for both eyes.
+    # Two conditions must both be true per frame:
+    #   1. Max Sobel gradient < _FLAT_GRAD_THRESHOLD (fixed, independent of blur settings).
+    #      20 on a 0-255 depth scale ≈ a depth step of ~4-5 gray levels within the
+    #      3-pixel Sobel window — conservative enough that real depth structure (cylinder
+    #      silhouettes, object edges) still passes, while smooth fades are caught.
+    #      Intentionally NOT tied to depth_blur_edge_threshold, which has a different
+    #      semantic purpose (artifact prevention) and is typically set much higher (6-20+).
+    #   2. Effective max displacement < flat_depth_threshold pixels.
+    # Only skips if ALL frames in the batch qualify — any non-flat frame keeps the whole batch.
+    _FLAT_GRAD_THRESHOLD = 20.0
+    skip_warp = False
+    if skip_flat_depth:
+        max_div_px = max(abs(left_divergence_px), abs(right_divergence_px))
+        if max_div_px > 0.01:
+            sobel_x_k = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
+                                     dtype=depth_tensor.dtype, device=device).view(1, 1, 3, 3)
+            grad_x_flat = F.conv2d(depth_tensor.unsqueeze(1), sobel_x_k, padding=1).squeeze(1)
+            max_grad  = grad_x_flat.abs().amax(dim=[1, 2])          # [B]
+            d_range   = depth_tensor.amax(dim=[1, 2]) - depth_tensor.amin(dim=[1, 2])  # [B], 0-255
+            eff_disp  = (d_range / 255.0) * max_div_px               # [B], pixels
+            all_flat  = ((max_grad < _FLAT_GRAD_THRESHOLD) &
+                         (eff_disp  < flat_depth_threshold)).all()
+            if all_flat:
+                skip_warp = True
+
+    left_mask  = torch.zeros(B, H, W, dtype=torch.bool, device=device)
     right_mask = torch.zeros(B, H, W, dtype=torch.bool, device=device)
 
-    if left_divergence < 0.001:
-        left_eye = image_tensor
-    else:
-        left_eye, left_mask = warp_fn(
-            image_tensor, left_depth, +left_divergence_px, -separation_px,
-            stereo_offset_exponent, convergence_point)
-
-    if right_divergence < 0.001:
+    if skip_warp:
+        left_eye  = image_tensor
         right_eye = image_tensor
     else:
-        right_eye, right_mask = warp_fn(
-            image_tensor, right_depth, -right_divergence_px, separation_px,
-            stereo_offset_exponent, convergence_point)
+        if left_divergence < 0.001:
+            left_eye = image_tensor
+        else:
+            left_eye, left_mask = warp_fn(
+                image_tensor, left_depth, +left_divergence_px, -separation_px,
+                stereo_offset_exponent, convergence_point)
+
+        if right_divergence < 0.001:
+            right_eye = image_tensor
+        else:
+            right_eye, right_mask = warp_fn(
+                image_tensor, right_depth, -right_divergence_px, separation_px,
+                stereo_offset_exponent, convergence_point)
 
     combined_mask = left_mask | right_mask
 
@@ -1423,7 +1456,8 @@ def create_stereoimages(original_image, depthmap, divergence, separation=0.0, mo
                         stereo_balance=0.0, stereo_offset_exponent=1.0, fill_technique='polylines_sharp',
                         depth_blur_strength=0.0, depth_blur_edge_threshold=6.0,
                         direction_aware_depth_blur=False, return_modified_depth=True, convergence_point=0.5,
-                        depth_blur_falloff=1.0, depth_blur_vert_smooth=0):
+                        depth_blur_falloff=1.0, depth_blur_vert_smooth=0,
+                        skip_flat_depth=False, flat_depth_threshold=1.5):
                             
     """
     Creates stereoscopic images.
@@ -1533,12 +1567,32 @@ def create_stereoimages(original_image, depthmap, divergence, separation=0.0, mo
     left_divergence = divergence * (1 + stereo_balance)
     right_divergence = divergence * (1 - stereo_balance)
 
-    left_eye = original_image if left_divergence < 0.001 else \
-        apply_stereo_divergence(original_image, left_depthmap, +1 * left_divergence, -1 * separation,
-                                stereo_offset_exponent, fill_technique, convergence_point)
-    right_eye = original_image if right_divergence < 0.001 else \
-        apply_stereo_divergence(original_image, right_depthmap, -1 * right_divergence, separation,
-                                stereo_offset_exponent, fill_technique, convergence_point)
+    # Flat-depth early exit (CPU path): same two-condition check as the GPU path.
+    # Uses the numpy depthmap (0-255 range) and Sobel from scipy.
+    _skip_warp = False
+    if skip_flat_depth:
+        _depth_check = left_depthmap if isinstance(left_depthmap, np.ndarray) else np.asarray(left_depthmap)
+        if _depth_check.ndim == 3:
+            _depth_check = _depth_check.mean(axis=2)  # collapse channels if present
+        _max_div_px = max(abs(left_divergence), abs(right_divergence)) / 100.0 * _depth_check.shape[1]
+        if _max_div_px > 0.01:
+            _grad = sobel(_depth_check.astype(np.float32), axis=1)
+            _max_grad   = np.abs(_grad).max()
+            _depth_range = float(_depth_check.max()) - float(_depth_check.min())
+            _eff_disp   = (_depth_range / 255.0) * _max_div_px
+            if _max_grad < 20.0 and _eff_disp < flat_depth_threshold:
+                _skip_warp = True
+
+    if _skip_warp:
+        left_eye  = original_image
+        right_eye = original_image
+    else:
+        left_eye = original_image if left_divergence < 0.001 else \
+            apply_stereo_divergence(original_image, left_depthmap, +1 * left_divergence, -1 * separation,
+                                    stereo_offset_exponent, fill_technique, convergence_point)
+        right_eye = original_image if right_divergence < 0.001 else \
+            apply_stereo_divergence(original_image, right_depthmap, -1 * right_divergence, separation,
+                                    stereo_offset_exponent, fill_technique, convergence_point)
     
     results = []
     for mode in modes:

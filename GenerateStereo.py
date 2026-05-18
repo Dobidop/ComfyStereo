@@ -68,6 +68,8 @@ class StereoImageNode:
                 "depth_blur_strength": ("FLOAT", {"default": 20, "min": 0.1, "max": 200, "step": 0.1, "tooltip": "The strength of the depth map blur. Higher values create a stronger blur effect, which can help smooth out depth maps that are noisy or have harsh transitions, but may also reduce the sharpness of depth details."}),
                 "depth_blur_falloff": ("FLOAT", {"default": 2.0, "min": 0.1, "max": 4.0, "step": 0.1, "tooltip": "Controls the falloff curve of the depth blur away from edges. 1.0 = linear decay (default). Higher values concentrate the blur tighter to edges, which reduces interaction between nearby objects and better preserves thin objects. Lower values create a wider, softer blur influence."}),
                 "depth_blur_vert_smooth": ("INT", {"default": 6, "min": 0, "max": 15, "step": 1, "tooltip": "Vertical smoothing radius (px) applied to the blur weight map. Blends blur activation across adjacent rows to eliminate horizontal stripe artifacts when the edge threshold is close to natural gradient variation. 0 = off. Try 3-7 to reduce stripes."}),
+                "skip_flat_depth": ("BOOLEAN", {"default": False, "tooltip": "When enabled, frames whose depth maps have negligible gradients and tiny pixel displacement are skipped — the original frame is duplicated instead of warped. Useful for video batches containing fades or near-uniform depth frames. Controlled by flat_depth_threshold."}),
+                "flat_depth_threshold": ("FLOAT", {"default": 1.5, "min": 0.1, "max": 10.0, "step": 0.1, "tooltip": "Maximum effective pixel displacement (in pixels) below which a frame is considered flat and skipped when skip_flat_depth is enabled. Only skips if there are also no detectable depth edges. Raise this to skip more frames; lower it to be more conservative."}),
                 "batch_size": ("INT", {"default": 12, "min": 1, "max": 64, "step": 1, "tooltip": "Number of frames to process before clearing GPU memory. Lower values use less memory but may be slower."}),
             }
         }
@@ -77,7 +79,7 @@ class StereoImageNode:
     FUNCTION = "generate"
 
     def generate(self, image, depth_map, divergence, separation, modes,
-                 stereo_balance, convergence_point, stereo_offset_exponent, fill_technique, depth_blur_edge_threshold, depth_blur_strength, depth_map_blur, depth_blur_falloff=1.0, depth_blur_vert_smooth=0, batch_size=4):
+                 stereo_balance, convergence_point, stereo_offset_exponent, fill_technique, depth_blur_edge_threshold, depth_blur_strength, depth_map_blur, depth_blur_falloff=1.0, depth_blur_vert_smooth=0, skip_flat_depth=False, flat_depth_threshold=1.5, batch_size=4):
 
         log_memory("START of generate()")
         if DEBUG_MEMORY:
@@ -153,7 +155,9 @@ class StereoImageNode:
                     [modes], stereo_balance, stereo_offset_exponent, convergence_point,
                     depth_blur_strength, depth_blur_edge_threshold, depth_map_blur,
                     depth_blur_falloff=depth_blur_falloff,
-                    depth_blur_vert_smooth=depth_blur_vert_smooth
+                    depth_blur_vert_smooth=depth_blur_vert_smooth,
+                    skip_flat_depth=skip_flat_depth,
+                    flat_depth_threshold=flat_depth_threshold
                 )
 
                 # Convert results [B, C, H, W] -> ComfyUI [B, H, W, C] on CPU
@@ -224,7 +228,9 @@ class StereoImageNode:
                                                  fill_technique, depth_blur_strength, depth_blur_edge_threshold,
                                                  depth_map_blur, convergence_point=convergence_point,
                                                  depth_blur_falloff=depth_blur_falloff,
-                                                 depth_blur_vert_smooth=depth_blur_vert_smooth)
+                                                 depth_blur_vert_smooth=depth_blur_vert_smooth,
+                                                 skip_flat_depth=skip_flat_depth,
+                                                 flat_depth_threshold=flat_depth_threshold)
 
                 if len(output) == 3:
                     results, left_modified_depthmap, right_modified_depthmap = output
