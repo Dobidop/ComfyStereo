@@ -453,7 +453,7 @@ def forward_warp_gpu(image_tensor, depth_tensor, divergence_px, separation_px,
 def forward_warp_mesh(image_tensor, depth_tensor, divergence_px, separation_px,
                       stereo_offset_exponent, convergence_point=0.5,
                       gradient_threshold=1.5, max_stretch=8,
-                      fill_depth_threshold=0.3, edge_setback=8):
+                      fill_depth_threshold=0.2, edge_setback=4):
     """
     GPU mesh-based stereo warp using ModernGL OpenGL rasterization.
     Drop-in replacement for forward_warp_gpu().
@@ -1221,7 +1221,7 @@ def create_stereoimages_gpu(image_tensor, depth_tensor, divergence, separation=0
                             direction_aware_depth_blur=False, depth_blur_falloff=1.0,
                             depth_blur_vert_smooth=0, skip_flat_depth=False,
                             flat_depth_threshold=1.5,
-                            fill_depth_threshold=0.3, edge_setback=8):
+                            fill_depth_threshold=0.2, edge_setback=4):
     """
     Fully GPU-accelerated stereo image generation with batch support.
 
