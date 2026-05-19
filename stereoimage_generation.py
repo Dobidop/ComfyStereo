@@ -843,17 +843,53 @@ def forward_warp_mesh(image_tensor, depth_tensor, divergence_px, separation_px,
         rp_has_L  = rp_near_L >= 0
         rp_has_R  = rp_near_R < W
 
-        # Pick the closer of the two; cap the search distance so we don't
-        # smear from a clearly-distant bg region in dense-fg scenes.
+        # Cap the search distance so we don't smear from a clearly-distant bg
+        # region in dense-fg scenes.
         RP_MAX_SEARCH = 32  # px around rp_target_col
-        rp_use_L = rp_has_L & (~rp_has_R | (rp_dist_L <= rp_dist_R))
-        rp_chosen_col  = torch.where(rp_use_L, rp_near_L, rp_near_R)
-        rp_chosen_dist = torch.where(rp_use_L, rp_dist_L, rp_dist_R)
+
+        # Linearly interpolate between the L and R bg neighbors instead of
+        # snap-picking the closer one. Snap-picking caused vertical striping
+        # next to fg silhouettes: neighboring rows / neighboring gap pixels
+        # would snap to different bg columns whenever rp_target_col landed
+        # on a thin fg strand in the source, producing visible discontinuities
+        # in the fill. Distance-weighted interpolation produces a smooth fill
+        # that varies continuously even when the chosen source column jumps.
+        # When only one side has a valid bg neighbor, weight collapses to it.
+        rp_only_L = rp_has_L & (~rp_has_R)
+        rp_only_R = rp_has_R & (~rp_has_L)
+        # Default both-have: weight by inverse distance.
+        denom = (rp_dist_L + rp_dist_R).clamp(min=1).float()
+        w_L_f = rp_dist_R.float() / denom  # closer L → larger w_L
+        w_L_f = torch.where(rp_only_L, torch.ones_like(w_L_f), w_L_f)
+        w_L_f = torch.where(rp_only_R, torch.zeros_like(w_L_f), w_L_f)
+
+        rp_chosen_dist = torch.minimum(rp_dist_L.where(rp_has_L, torch.full_like(rp_dist_L, W)),
+                                       rp_dist_R.where(rp_has_R, torch.full_like(rp_dist_R, W)))
         rp_in_range    = (rp_target_col >= -RP_MAX_SEARCH) & (rp_target_col < W + RP_MAX_SEARCH)
         rp_valid       = (rp_has_L | rp_has_R) & (rp_chosen_dist <= RP_MAX_SEARCH) & rp_in_range
 
-        rp_idx     = rp_chosen_col.clamp(0, W - 1).unsqueeze(1).expand_as(image_tensor)
-        rp_color   = image_tensor.gather(3, rp_idx)
+        # Step edge_setback further into bg in source space, away from the
+        # anti-aliased fg silhouette edge. The L neighbor sits just past the
+        # fg's left edge in source (the pixel where bg starts); stepping
+        # further left lands on cleaner bg. Same idea on the right side.
+        # Without this, sampled pixels are fg-tinted from source-image AA
+        # and jitter row-to-row with depth-map silhouette noise → striping.
+        rp_sample_L_c = (rp_near_L - edge_setback).clamp(0, W - 1)
+        rp_sample_R_c = (rp_near_R + edge_setback).clamp(0, W - 1)
+        idx_L = rp_sample_L_c.unsqueeze(1).expand_as(image_tensor)
+        idx_R = rp_sample_R_c.unsqueeze(1).expand_as(image_tensor)
+        color_L = image_tensor.gather(3, idx_L)
+        color_R = image_tensor.gather(3, idx_R)
+        w_L_4d = w_L_f.unsqueeze(1).expand_as(warped)
+        rp_color = color_L * w_L_4d + color_R * (1.0 - w_L_4d)
+
+        # Vertically smooth rp_color by 5 px to suppress residual row-to-row
+        # variation (from noisy source depth-edge positions). Only active where
+        # the gap region is itself vertically continuous; isolated single-row
+        # gap pixels barely shift since the kernel still averages mostly
+        # in-gap content. Cheap separable blur, applied uniformly.
+        rp_color = F.avg_pool2d(rp_color, kernel_size=(5, 1),
+                                stride=1, padding=(2, 0))
 
         rp_valid_4d = rp_valid.unsqueeze(1).expand_as(warped)
         fill_color  = torch.where(rp_valid_4d, rp_color, fill_color)
