@@ -452,7 +452,8 @@ def forward_warp_gpu(image_tensor, depth_tensor, divergence_px, separation_px,
 
 def forward_warp_mesh(image_tensor, depth_tensor, divergence_px, separation_px,
                       stereo_offset_exponent, convergence_point=0.5,
-                      gradient_threshold=1.5, max_stretch=8):
+                      gradient_threshold=1.5, max_stretch=8,
+                      fill_depth_threshold=0.3, edge_setback=8):
     """
     GPU mesh-based stereo warp using ModernGL OpenGL rasterization.
     Drop-in replacement for forward_warp_gpu().
@@ -683,83 +684,180 @@ def forward_warp_mesh(image_tensor, depth_tensor, divergence_px, separation_px,
     # return value (so the node's MASK output still reflects only rasterizer-
     # uncovered pixels); only the local effective_gap_mask used by fill logic
     # is extended.
-    transition_mask = (~gap_mask) & (rendered_depth >= 0.5) & (rendered_depth < 0.8)
-    transition_dilation_px = 4
-    gap_dilated_f = F.max_pool2d(
-        gap_mask.float().unsqueeze(1),
-        (1, 2 * transition_dilation_px + 1),
-        stride=1,
-        padding=(0, transition_dilation_px),
-    ).squeeze(1)
-    near_gap = gap_dilated_f > 0.5
-    effective_gap_mask = gap_mask | (transition_mask & near_gap)
+    effective_gap_mask = gap_mask
 
     if effective_gap_mask.any():
         filled_mask = ~effective_gap_mask
-        # Anything below this normalized-depth value is considered bg-eligible
-        # for fill. 0 = far/bg, 1 = near/fg. 0.5 splits at the depth midpoint.
-        fill_depth_threshold = 0.5
+        # Bg-eligibility for fill sources. Lower fill_depth_threshold = stricter
+        # (only deep-bg pixels qualify). Mid-depth pixels at the fg/bg boundary
+        # are barycentric-interpolated by stretched-mesh triangles and tend to
+        # be fg-tinted; excluding them prevents the "translated fg edge" smear.
         bg_eligible = filled_mask & (rendered_depth < fill_depth_threshold)
 
-        # Cap how far the gap-fill is allowed to reach for a bg source. If no
-        # bg-eligible pixel exists within this range, fall back to the original
-        # nearest-filled behavior. Without this cap, sparse-bg rows (mostly-fg
-        # scenes) end up sourcing from whichever true-bg pixel happens to exist
-        # in the row — typically near the frame edge, producing visible smears
-        # across half the image.
+        # Fg-barrier mask: pixels clearly belonging to a foreground object.
+        # The bg search treats these as blockers (it will NOT reach past them)
+        # so a thin fg silhouette can't be skipped over to sample bg from the
+        # wrong side of it — that was producing intermittent fg→bg smears in
+        # small gaps adjacent to thin fg features. 0.7 is a generous threshold:
+        # anything above it is unambiguously fg.
+        fg_barrier_threshold = 0.7
+        fg_barrier = filled_mask & (rendered_depth >= fg_barrier_threshold)
+
+        # Cap how far the gap-fill is allowed to reach for a bg source.
         max_fill_dist = max(int(abs(divergence_px) * 1.5), 40)
 
-        # Step further into the bg, away from the edge transition zone, before
-        # sampling color. Pixels right at the fg/bg boundary often have bg-like
-        # rendered_depth but fg-tinted color (from barycentric interpolation in
-        # kept stretched-mesh triangles, and from OpenGL edge anti-aliasing).
-        # Sampling a few pixels deeper into the bg skips this transition zone
-        # and produces cleaner fill colors.
-        edge_setback = 3
-
         cols = torch.arange(W, device=device, dtype=torch.long).view(1, 1, W).expand(B, H, W)
+        SENT_L = -1       # left-search sentinel ( cummax  → "none found")
+        SENT_R = W        # right-search sentinel ( cummin → "none found")
 
+        # --- LEFT search (largest col ≤ current; smaller col = further left) ---
+        bg_col_L   = torch.where(bg_eligible, cols, torch.full_like(cols, SENT_L))
+        fg_col_L   = torch.where(fg_barrier,  cols, torch.full_like(cols, SENT_L))
+        fill_col_L = torch.where(filled_mask, cols, torch.full_like(cols, SENT_L))
+        bg_near_L,   _ = torch.cummax(bg_col_L,   dim=2)
+        fg_near_L,   _ = torch.cummax(fg_col_L,   dim=2)
+        fill_near_L, _ = torch.cummax(fill_col_L, dim=2)
+        # Primary bg requires barrier-respect: no fg between current and bg.
+        bg_valid_L  = (bg_near_L >= 0) & (bg_near_L >= fg_near_L) & ((cols - bg_near_L) <= max_fill_dist)
+        fill_has_L  = fill_near_L >= 0
+        bg_sample_L = (bg_near_L - edge_setback).clamp(min=0)
+        # Fallback sample: step edge_setback past the gap boundary into whatever
+        # is there. Does NOT consult bg_eligible — used for frame-edge gaps
+        # where the bg-eligible search finds nothing usable.
+        fallback_sample_L = (fill_near_L + edge_setback).clamp(min=0)
+
+        # --- RIGHT search (smallest col ≥ current; larger col = further right) ---
+        bg_col_R   = torch.where(bg_eligible, cols, torch.full_like(cols, SENT_R))
+        fg_col_R   = torch.where(fg_barrier,  cols, torch.full_like(cols, SENT_R))
+        fill_col_R = torch.where(filled_mask, cols, torch.full_like(cols, SENT_R))
+        bg_near_R   = torch.flip(torch.cummin(torch.flip(bg_col_R,   [2]), dim=2).values, [2])
+        fg_near_R   = torch.flip(torch.cummin(torch.flip(fg_col_R,   [2]), dim=2).values, [2])
+        fill_near_R = torch.flip(torch.cummin(torch.flip(fill_col_R, [2]), dim=2).values, [2])
+        bg_valid_R  = (bg_near_R < W) & (bg_near_R <= fg_near_R) & ((bg_near_R - cols) <= max_fill_dist)
+        fill_has_R  = fill_near_R < W
+        bg_sample_R = (bg_near_R + edge_setback).clamp(max=W - 1)
+        fallback_sample_R = (fill_near_R - edge_setback).clamp(max=W - 1)
+
+        # Per-eye primary/secondary direction assignment.
         if divergence_px >= 0:
-            # Left eye: search to the LEFT — cummax over column index with sentinel = -1
-            bg_col       = torch.where(bg_eligible, cols, torch.full_like(cols, -1))
-            fill_col     = torch.where(filled_mask, cols, torch.full_like(cols, -1))
-            bg_nearest,   _ = torch.cummax(bg_col,   dim=2)
-            fill_nearest, _ = torch.cummax(fill_col, dim=2)
-            bg_dist       = cols - bg_nearest
-            bg_has        = bg_nearest   >= 0
-            fill_has      = fill_nearest >= 0
-            bg_sample_col = (bg_nearest - edge_setback).clamp(min=0)
+            primary_bg_sample,   primary_bg_valid   = bg_sample_L, bg_valid_L
+            primary_fill_has                        = fill_has_L
+            primary_fallback                        = fallback_sample_L
+            primary_fill_near                       = fill_near_L
+            secondary_bg_sample, secondary_bg_valid = bg_sample_R, bg_valid_R
+            secondary_fill_has                      = fill_has_R
+            secondary_fallback                      = fallback_sample_R
+            secondary_fill_near                     = fill_near_R
+            bg_near_P_fallback                      = bg_near_L
+            bg_near_S_fallback                      = bg_near_R
         else:
-            # Right eye: search to the RIGHT — cummin on flipped cols with sentinel = W
-            # (mirrors the proven pattern from the original fallback code)
-            bg_col       = torch.where(bg_eligible, cols, torch.full_like(cols, W))
-            fill_col     = torch.where(filled_mask, cols, torch.full_like(cols, W))
-            bg_nearest_flip,   _ = torch.cummin(torch.flip(bg_col,   [2]), dim=2)
-            fill_nearest_flip, _ = torch.cummin(torch.flip(fill_col, [2]), dim=2)
-            bg_nearest   = torch.flip(bg_nearest_flip,   [2])
-            fill_nearest = torch.flip(fill_nearest_flip, [2])
-            bg_dist       = bg_nearest - cols
-            bg_has        = bg_nearest   < W
-            fill_has      = fill_nearest < W
-            bg_sample_col = (bg_nearest + edge_setback).clamp(max=W - 1)
+            primary_bg_sample,   primary_bg_valid   = bg_sample_R, bg_valid_R
+            primary_fill_has                        = fill_has_R
+            primary_fallback                        = fallback_sample_R
+            primary_fill_near                       = fill_near_R
+            secondary_bg_sample, secondary_bg_valid = bg_sample_L, bg_valid_L
+            secondary_fill_has                      = fill_has_L
+            secondary_fallback                      = fallback_sample_L
+            secondary_fill_near                     = fill_near_L
+            bg_near_P_fallback                      = bg_near_R
+            bg_near_S_fallback                      = bg_near_L
 
-        # Safety: verify the stepped-back column is actually bg-eligible. If the
-        # setback overshot into another gap (→ would gather black-cleared pixels)
-        # or into a foreground pixel (→ would smear fg as if it were bg), fall
-        # back to bg_nearest itself for that pixel. bg_nearest is guaranteed
-        # bg-eligible since it came from the cummax/cummin over bg_eligible.
-        bg_nearest_clamped = bg_nearest.clamp(min=0, max=W - 1)
-        sample_is_bg = bg_eligible.gather(2, bg_sample_col)
-        bg_sample_col = torch.where(sample_is_bg, bg_sample_col, bg_nearest_clamped)
+        # Safety #1: confirm primary/secondary BG samples are bg-eligible.
+        # If setback overshoots into a gap or fg pixel, fall back to the
+        # un-stepped nearest bg column.
+        sample_is_bg_P = bg_eligible.gather(2, primary_bg_sample.clamp(0, W - 1))
+        sample_is_bg_S = bg_eligible.gather(2, secondary_bg_sample.clamp(0, W - 1))
+        primary_bg_sample   = torch.where(sample_is_bg_P, primary_bg_sample,
+                                          bg_near_P_fallback.clamp(0, W - 1))
+        secondary_bg_sample = torch.where(sample_is_bg_S, secondary_bg_sample,
+                                          bg_near_S_fallback.clamp(0, W - 1))
 
-        # Use the bg sample (stepped back from the edge, with safety fallback) if
-        # present and within reach; otherwise fall back to nearest-filled.
-        use_bg         = bg_has & (bg_dist <= max_fill_dist)
-        chosen_nearest = torch.where(use_bg, bg_sample_col, fill_nearest)
-        has_fill       = use_bg | fill_has
+        # Safety #2: the "fixed-step inward" fallback samples can land inside
+        # the gap region itself (cleared to black). Verify each fallback column
+        # is NOT in effective_gap_mask; if it is, snap back to the gap-boundary
+        # fill_near (guaranteed non-gap by construction).
+        primary_fallback_safe   = torch.where(
+            effective_gap_mask.gather(2, primary_fallback.clamp(0, W - 1)),
+            primary_fill_near.clamp(0, W - 1),
+            primary_fallback.clamp(0, W - 1))
+        secondary_fallback_safe = torch.where(
+            effective_gap_mask.gather(2, secondary_fallback.clamp(0, W - 1)),
+            secondary_fill_near.clamp(0, W - 1),
+            secondary_fallback.clamp(0, W - 1))
 
-        fill_idx = chosen_nearest.clamp(0, W - 1).unsqueeze(1).expand_as(warped)
+        # Resolution priority (best → worst):
+        #   1. primary bg (barrier-respected, within max_fill_dist)
+        #   2. secondary bg (barrier-respected) — bidirectional bg fallback
+        #   3. primary "fixed-step" sample: edge_setback past the gap boundary
+        #      in the primary direction, ignoring bg_eligible. Used for gaps
+        #      where neither direction found a clean bg pixel — typically
+        #      frame-edge gaps. Predictable: just steps N px from the gap edge.
+        #   4. secondary "fixed-step" sample (the other direction's fallback)
+        # Remaining pixels stay black (no reachable source).
+        chosen = secondary_fallback_safe
+        has_fill = secondary_fill_has.clone()
+
+        chosen   = torch.where(primary_fill_has,   primary_fallback_safe, chosen)
+        has_fill = has_fill | primary_fill_has
+
+        chosen   = torch.where(secondary_bg_valid, secondary_bg_sample, chosen)
+        has_fill = has_fill | secondary_bg_valid
+
+        chosen   = torch.where(primary_bg_valid,   primary_bg_sample,   chosen)
+        has_fill = has_fill | primary_bg_valid
+
+        fill_idx = chosen.clamp(0, W - 1).unsqueeze(1).expand_as(warped)
         fill_color = warped.gather(3, fill_idx)
+
+        # Reverse-projection: for each gap pixel, compute where the bg pixel
+        # that should fill it ORIGINALLY lived in the source image, and sample
+        # there directly. Assumes bg depth = 0; inverts the forward warp:
+        #   bg_offset_depth = -(convergence_point ** exponent)
+        #   bg_pixel_offset = bg_offset_depth * divergence_px + separation_px
+        #   src_col         = dest_col - bg_pixel_offset
+        # If the source pixel at src_col is itself fg in the original (e.g.,
+        # another hair strand happens to occupy that column), we widen the
+        # search: find the nearest bg-eligible column in the SOURCE image
+        # around src_col. Hair-like scenes have bg visible between strands,
+        # so a nearby column almost always carries the correct color.
+        # When found, this overrides every horizontal-search strategy above.
+        bg_offset_depth  = -(convergence_point ** stereo_offset_exponent)
+        bg_pixel_offset  = bg_offset_depth * divergence_px + separation_px
+        rp_target_col    = (cols.float() - bg_pixel_offset).round().long()
+        rp_target_clamp  = rp_target_col.clamp(0, W - 1)
+
+        # Per-row, per-column nearest bg-eligible column in the SOURCE image
+        # (both directions). Computed once per warp, reused for every gap.
+        src_bg = normalized_depth < fill_depth_threshold  # [B, H, W]
+        src_bg_col_L = torch.where(src_bg, cols, torch.full_like(cols, SENT_L))
+        src_bg_col_R = torch.where(src_bg, cols, torch.full_like(cols, SENT_R))
+        src_bg_near_L, _ = torch.cummax(src_bg_col_L, dim=2)
+        src_bg_near_R    = torch.flip(
+            torch.cummin(torch.flip(src_bg_col_R, [2]), dim=2).values, [2])
+
+        # At the target column, look up nearest src-bg to left and right.
+        rp_near_L = src_bg_near_L.gather(2, rp_target_clamp)
+        rp_near_R = src_bg_near_R.gather(2, rp_target_clamp)
+        rp_dist_L = (rp_target_clamp - rp_near_L).clamp(min=0)
+        rp_dist_R = (rp_near_R - rp_target_clamp).clamp(min=0)
+        rp_has_L  = rp_near_L >= 0
+        rp_has_R  = rp_near_R < W
+
+        # Pick the closer of the two; cap the search distance so we don't
+        # smear from a clearly-distant bg region in dense-fg scenes.
+        RP_MAX_SEARCH = 32  # px around rp_target_col
+        rp_use_L = rp_has_L & (~rp_has_R | (rp_dist_L <= rp_dist_R))
+        rp_chosen_col  = torch.where(rp_use_L, rp_near_L, rp_near_R)
+        rp_chosen_dist = torch.where(rp_use_L, rp_dist_L, rp_dist_R)
+        rp_in_range    = (rp_target_col >= -RP_MAX_SEARCH) & (rp_target_col < W + RP_MAX_SEARCH)
+        rp_valid       = (rp_has_L | rp_has_R) & (rp_chosen_dist <= RP_MAX_SEARCH) & rp_in_range
+
+        rp_idx     = rp_chosen_col.clamp(0, W - 1).unsqueeze(1).expand_as(image_tensor)
+        rp_color   = image_tensor.gather(3, rp_idx)
+
+        rp_valid_4d = rp_valid.unsqueeze(1).expand_as(warped)
+        fill_color  = torch.where(rp_valid_4d, rp_color, fill_color)
+        has_fill    = has_fill | rp_valid
 
         gap_mask_4d = effective_gap_mask.unsqueeze(1).expand_as(warped)
         has_fill_4d = has_fill.unsqueeze(1).expand_as(warped)
@@ -1086,7 +1184,8 @@ def create_stereoimages_gpu(image_tensor, depth_tensor, divergence, separation=0
                             depth_blur_strength=0.0, depth_blur_edge_threshold=6.0,
                             direction_aware_depth_blur=False, depth_blur_falloff=1.0,
                             depth_blur_vert_smooth=0, skip_flat_depth=False,
-                            flat_depth_threshold=1.5):
+                            flat_depth_threshold=1.5,
+                            fill_depth_threshold=0.3, edge_setback=8):
     """
     Fully GPU-accelerated stereo image generation with batch support.
 
@@ -1144,10 +1243,15 @@ def create_stereoimages_gpu(image_tensor, depth_tensor, divergence, separation=0
     right_divergence_px = (right_divergence / 100.0) * W
     separation_px = (separation / 100.0) * W
 
-    # Select warp function: ModernGL mesh rasterizer if available, else scatter-based fallback
+    # Select warp function: ModernGL mesh rasterizer if available, else scatter-based fallback.
+    # The mesh path accepts fill_depth_threshold / edge_setback (gap-fill tuning); the scatter
+    # fallback ignores them.
     if MODERNGL_AVAILABLE:
+        warp_kwargs = {'fill_depth_threshold': fill_depth_threshold,
+                       'edge_setback': edge_setback}
         warp_fn = forward_warp_mesh
     else:
+        warp_kwargs = {}
         warp_fn = forward_warp_gpu
 
     # Flat-depth early exit: if every frame in the batch has a depth map that is both
@@ -1185,19 +1289,32 @@ def create_stereoimages_gpu(image_tensor, depth_tensor, divergence, separation=0
         left_eye  = image_tensor
         right_eye = image_tensor
     else:
+        # OpenGL's top-left fill rule loses 1 px wherever a triangle's *right*
+        # edge passes through a pixel center. For the right eye (negative
+        # divergence), this loss falls on the disocclusion side of fg and is
+        # hidden by gap fill. For the left eye (positive divergence) it falls
+        # on the *occlusion* side — producing a visible bg-colored band right
+        # at the fg silhouette. Routing the left eye through a flipped warp
+        # makes it use the right eye's rasterization path, so the loss lands
+        # on the disocclusion side (hidden) for both eyes. Net effect:
+        # symmetric artifact profile, no visible bg band at the fg edge.
         if left_divergence < 0.001:
             left_eye = image_tensor
         else:
-            left_eye, left_mask = warp_fn(
-                image_tensor, left_depth, +left_divergence_px, -separation_px,
-                stereo_offset_exponent, convergence_point)
+            image_flipped     = image_tensor.flip(3)
+            left_depth_flipped = left_depth.flip(2)
+            left_eye_flipped, left_mask_flipped = warp_fn(
+                image_flipped, left_depth_flipped, -left_divergence_px, +separation_px,
+                stereo_offset_exponent, convergence_point, **warp_kwargs)
+            left_eye  = left_eye_flipped.flip(3)
+            left_mask = left_mask_flipped.flip(2)
 
         if right_divergence < 0.001:
             right_eye = image_tensor
         else:
             right_eye, right_mask = warp_fn(
                 image_tensor, right_depth, -right_divergence_px, separation_px,
-                stereo_offset_exponent, convergence_point)
+                stereo_offset_exponent, convergence_point, **warp_kwargs)
 
     combined_mask = left_mask | right_mask
 
