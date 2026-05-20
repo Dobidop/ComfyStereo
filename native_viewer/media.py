@@ -26,7 +26,7 @@ def load_image_texture(image_path, texture_id=None):
 
     img = Image.open(image_path)
     img = img.convert('RGB')
-    img_data = np.array(img, dtype=np.uint8)
+    img_data = np.ascontiguousarray(np.array(img, dtype=np.uint8))
 
     print(f"   Image size: {img.width}x{img.height}, channels: {img_data.shape}")
 
@@ -41,6 +41,10 @@ def load_image_texture(image_path, texture_id=None):
     GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_T, GL.GL_REPEAT)
     GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_LINEAR)
     GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_LINEAR)
+
+    # RGB rows aren't 4-byte aligned when width % 4 != 0; without this,
+    # glTexImage2D reads past the numpy buffer and crashes.
+    GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 1)
 
     # Use GL_SRGB8 internal format to handle sRGB color space correctly
     # This prevents the washed-out look caused by treating sRGB data as linear
@@ -95,7 +99,7 @@ def update_texture_from_frame(frame, texture_id=None):
         raise ImportError("PyOpenXR dependencies not available")
 
     # OpenCV uses BGR, convert to RGB
-    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    frame_rgb = np.ascontiguousarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
 
     height, width = frame_rgb.shape[:2]
 
@@ -107,6 +111,7 @@ def update_texture_from_frame(frame, texture_id=None):
     GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_T, GL.GL_REPEAT)
     GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_LINEAR)
     GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_LINEAR)
+    GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 1)
 
     # Use GL_SRGB8 internal format to handle sRGB color space correctly
     # This prevents the washed-out look caused by treating sRGB data as linear

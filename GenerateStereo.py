@@ -63,11 +63,10 @@ class StereoImageNode:
                 "stereo_balance": ("FLOAT", {"default": 0, "min": -0.95, "max": 0.95, "step": 0.05, "tooltip": "Adjusts the balance between the left and right images. Positive values favor the left image, while negative values favor the right image. This can help correct for any imbalance in the stereo effect."}),
                 "convergence_point": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Controls the depth at which the stereo effect converges. 0.0 means convergence at the back, 1.0 means convergence at the front."}),
                 "stereo_offset_exponent": ("FLOAT", {"default": 1, "min": 0.1, "max": 2, "step": 0.1, "tooltip": "Controls the curve of the depth mapping. Higher values create a more pronounced effect at closer depths, while lower values create a more uniform effect across all depths."}),
-                "depth_map_blur": ("BOOLEAN", {"default": True, "tooltip": "Whether to apply a blur to the depth map before processing. Blurring can help reduce noise and create smoother depth transitions, which can improve the quality of the stereo effect, especially in areas with high-frequency details."}),
-                "depth_blur_edge_threshold": ("FLOAT", {"default": 20, "min": 0.1, "max": 60, "step": 0.1, "tooltip": "When depth map blurring is enabled, this threshold controls how aggressively edges are preserved. Lower values will preserve more edges, while higher values will allow more blurring across edges."}),
-                "depth_blur_strength": ("FLOAT", {"default": 20, "min": 0.1, "max": 200, "step": 0.1, "tooltip": "The strength of the depth map blur. Higher values create a stronger blur effect, which can help smooth out depth maps that are noisy or have harsh transitions, but may also reduce the sharpness of depth details."}),
-                "depth_blur_falloff": ("FLOAT", {"default": 2.0, "min": 0.1, "max": 4.0, "step": 0.1, "tooltip": "Controls the falloff curve of the depth blur away from edges. 1.0 = linear decay (default). Higher values concentrate the blur tighter to edges, which reduces interaction between nearby objects and better preserves thin objects. Lower values create a wider, softer blur influence."}),
-                "depth_blur_vert_smooth": ("INT", {"default": 6, "min": 0, "max": 15, "step": 1, "tooltip": "Vertical smoothing radius (px) applied to the blur weight map. Blends blur activation across adjacent rows to eliminate horizontal stripe artifacts when the edge threshold is close to natural gradient variation. 0 = off. Try 3-7 to reduce stripes."}),
+                "depth_edge_blur": ("BOOLEAN", {"default": True, "tooltip": "Blur the depth map at foreground edges so the warp covers small silhouette gaps. Mesh-warp path only."}),
+                "extend_radius": ("INT", {"default": 5, "min": 0, "max": 30, "step": 1, "tooltip": "Max reach of silhouette extension (px). 0 disables."}),
+                "extend_edge_threshold": ("FLOAT", {"default": 10.0, "min": 0.0, "max": 100.0, "step": 0.5, "tooltip": "Min edge steepness to trigger extension (% depth jump per pixel). Higher = only crisp edges."}),
+                "extend_fade_distance": ("INT", {"default": 5, "min": 1, "max": 50, "step": 1, "tooltip": "Distance (px) over which the extended foreground tapers to background."}),
                 "skip_flat_depth": ("BOOLEAN", {"default": False, "tooltip": "When enabled, frames whose depth maps have negligible gradients and tiny pixel displacement are skipped — the original frame is duplicated instead of warped. Useful for video batches containing fades or near-uniform depth frames. Controlled by flat_depth_threshold."}),
                 "flat_depth_threshold": ("FLOAT", {"default": 1.5, "min": 0.1, "max": 10.0, "step": 0.1, "tooltip": "Maximum effective pixel displacement (in pixels) below which a frame is considered flat and skipped when skip_flat_depth is enabled. Only skips if there are also no detectable depth edges. Raise this to skip more frames; lower it to be more conservative."}),
                 "batch_size": ("INT", {"default": 12, "min": 1, "max": 64, "step": 1, "tooltip": "Number of frames to process before clearing GPU memory. Lower values use less memory but may be slower."}),
@@ -75,11 +74,14 @@ class StereoImageNode:
         }
     
     RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", "MASK")
-    RETURN_NAMES = ("stereoscope", "blurred_depthmap_left", "blurred_depthmap_right", "no_fill_imperfect_mask")
+    RETURN_NAMES = ("stereoscope", "extended_depthmap_left", "extended_depthmap_right", "no_fill_imperfect_mask")
     FUNCTION = "generate"
 
     def generate(self, image, depth_map, divergence, separation, modes,
-                 stereo_balance, convergence_point, stereo_offset_exponent, fill_technique, depth_blur_edge_threshold, depth_blur_strength, depth_map_blur, depth_blur_falloff=1.0, depth_blur_vert_smooth=0, skip_flat_depth=False, flat_depth_threshold=1.5, fill_depth_threshold=0.2, edge_setback=4, batch_size=4):
+                 stereo_balance, convergence_point, stereo_offset_exponent, fill_technique,
+                 depth_edge_blur=True, extend_radius=8, extend_edge_threshold=10.0,
+                 extend_fade_distance=20, skip_flat_depth=False, flat_depth_threshold=1.5,
+                 fill_depth_threshold=0.2, edge_setback=4, batch_size=4):
 
         log_memory("START of generate()")
         if DEBUG_MEMORY:
@@ -113,7 +115,6 @@ class StereoImageNode:
 
         log_memory("Before processing loop")
 
-        #depth_blur_strength = 20 #divergence if depth_map_blur else 0
 
         # GPU batched path: process multiple frames per GPU call
         if fill_technique == 'gpu_warp':
@@ -153,13 +154,14 @@ class StereoImageNode:
                 results_tensors, left_depth, right_depth, disocclusion_mask = sig.create_stereoimages_gpu(
                     img_batch, dm_batch, divergence, separation,
                     [modes], stereo_balance, stereo_offset_exponent, convergence_point,
-                    depth_blur_strength, depth_blur_edge_threshold, depth_map_blur,
-                    depth_blur_falloff=depth_blur_falloff,
-                    depth_blur_vert_smooth=depth_blur_vert_smooth,
                     skip_flat_depth=skip_flat_depth,
                     flat_depth_threshold=flat_depth_threshold,
                     fill_depth_threshold=fill_depth_threshold,
                     edge_setback=edge_setback,
+                    silhouette_extend=depth_edge_blur,
+                    extend_radius=extend_radius,
+                    extend_edge_threshold=extend_edge_threshold,
+                    extend_fade_distance=extend_fade_distance,
                 )
 
                 # Convert results [B, C, H, W] -> ComfyUI [B, H, W, C] on CPU
@@ -227,10 +229,7 @@ class StereoImageNode:
 
                 output = sig.create_stereoimages(img_tensor, dm_tensor, divergence, separation,
                                                  [modes], stereo_balance, stereo_offset_exponent,
-                                                 fill_technique, depth_blur_strength, depth_blur_edge_threshold,
-                                                 depth_map_blur, convergence_point=convergence_point,
-                                                 depth_blur_falloff=depth_blur_falloff,
-                                                 depth_blur_vert_smooth=depth_blur_vert_smooth,
+                                                 fill_technique, convergence_point=convergence_point,
                                                  skip_flat_depth=skip_flat_depth,
                                                  flat_depth_threshold=flat_depth_threshold)
 
