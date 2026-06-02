@@ -6,7 +6,30 @@ Functions for loading Stable Diffusion models from HuggingFace or local paths.
 
 import os
 import torch
-from diffusers import StableDiffusionPipeline, StableDiffusionInpaintPipeline, DDIMScheduler, EulerDiscreteScheduler
+
+# Lazy imports for diffusers to avoid hard failures on incompatible versions
+# (e.g. transformers >=5.x removed FLAX_WEIGHTS_NAME that older diffusers expect).
+# These are only needed for the optional StereoDiffusion feature.
+_diffusers = None
+
+
+def _get_diffusers():
+    """Lazily import diffusers components."""
+    global _diffusers
+    if _diffusers is None:
+        from diffusers import (
+            StableDiffusionPipeline,
+            StableDiffusionInpaintPipeline,
+            DDIMScheduler,
+            EulerDiscreteScheduler,
+        )
+        _diffusers = {
+            "StableDiffusionPipeline": StableDiffusionPipeline,
+            "StableDiffusionInpaintPipeline": StableDiffusionInpaintPipeline,
+            "DDIMScheduler": DDIMScheduler,
+            "EulerDiscreteScheduler": EulerDiscreteScheduler,
+        }
+    return _diffusers
 
 
 # Global model cache
@@ -40,6 +63,11 @@ def load_sd_model(model_id_or_path: str = "runwayml/stable-diffusion-v1-5", devi
     cache_key = f"{model_id_or_path}:{scheduler_type}"
     if cache_key in _model_cache:
         return _model_cache[cache_key]
+
+    d = _get_diffusers()
+    StableDiffusionPipeline = d["StableDiffusionPipeline"]
+    DDIMScheduler = d["DDIMScheduler"]
+    EulerDiscreteScheduler = d["EulerDiscreteScheduler"]
 
     if scheduler_type == "euler":
         scheduler = EulerDiscreteScheduler(
@@ -110,6 +138,9 @@ def load_inpainting_model(model_id_or_path: str = "runwayml/stable-diffusion-inp
     cache_key = f"inpaint:{model_id_or_path}"
     if cache_key in _model_cache:
         return _model_cache[cache_key]
+
+    d = _get_diffusers()
+    StableDiffusionInpaintPipeline = d["StableDiffusionInpaintPipeline"]
 
     is_local = os.path.isdir(model_id_or_path)
     model_dtype = torch.float16 if device != "cpu" else torch.float32

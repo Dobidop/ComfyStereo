@@ -26,19 +26,25 @@ except ImportError as e:
     print("  pip install -r requirements.txt")
     print("="*60 + "\n")
 
-# Import StereoDiffusion nodes (optional, requires diffusers)
+# Import StereoDiffusion nodes (optional, requires diffusers + compatible transformers)
 try:
     from .stereodiffusion_nodes import NODE_CLASS_MAPPINGS as DIFFUSION_NODES
     from .stereodiffusion_nodes import NODE_DISPLAY_NAME_MAPPINGS as DIFFUSION_NAMES
     DIFFUSION_AVAILABLE = True
-except ImportError as e:
+except Exception as e:  # Catch ImportError, RuntimeError from lazy diffusers load, etc.
     DIFFUSION_NODES = {}
     DIFFUSION_NAMES = {}
     DIFFUSION_AVAILABLE = False
     print("\n" + "="*60)
-    print("StereoDiffusion dependencies not available. AI stereo generation disabled.")
-    print("To enable StereoDiffusion:")
-    print("  pip install diffusers transformers accelerate einops tqdm scikit-image")
+    print("StereoDiffusion (AI-powered stereo) disabled due to import error.")
+    print(f"  Reason: {type(e).__name__}: {e}")
+    print("This is common with newer transformers versions (>=5.x) + older diffusers.")
+    print("Core depth-based StereoImageNode is unaffected and fully functional.")
+    print("")
+    print("To enable StereoDiffusion (optional):")
+    print("  pip install --upgrade 'diffusers>=0.29' 'transformers<5.0' accelerate einops tqdm scikit-image")
+    print("  or pin compatible versions in your environment.")
+    print("See https://github.com/Dobidop/ComfyStereo/issues for updates.")
     print("="*60 + "\n")
 
 # Combine all node mappings

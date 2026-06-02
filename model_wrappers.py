@@ -10,8 +10,23 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from PIL import Image
-from diffusers import DDIMScheduler, EulerDiscreteScheduler, PNDMScheduler
 from tqdm import tqdm
+
+# Lazy import for diffusers schedulers (only needed for ComfyUI model wrapper path in StereoDiffusion)
+_diffusers_schedulers = None
+
+
+def _get_diffusers_schedulers():
+    """Lazily import only the scheduler classes from diffusers."""
+    global _diffusers_schedulers
+    if _diffusers_schedulers is None:
+        from diffusers import DDIMScheduler, EulerDiscreteScheduler, PNDMScheduler
+        _diffusers_schedulers = {
+            "DDIMScheduler": DDIMScheduler,
+            "EulerDiscreteScheduler": EulerDiscreteScheduler,
+            "PNDMScheduler": PNDMScheduler,
+        }
+    return _diffusers_schedulers
 
 # Import functional_call for gradient-enabled forward passes
 # Available in PyTorch 2.0+ as torch.func, fallback to functorch for older versions
@@ -418,15 +433,16 @@ class ComfyUIModelWrapper:
 
     def _create_scheduler(self):
         """Create appropriate scheduler based on detected model type."""
+        sched = _get_diffusers_schedulers()
         if self._model_type == "SD_TURBO":
-            return EulerDiscreteScheduler(
+            return sched["EulerDiscreteScheduler"](
                 beta_start=0.00085,
                 beta_end=0.012,
                 beta_schedule="scaled_linear",
                 timestep_spacing="trailing",
             )
         else:
-            return DDIMScheduler(
+            return sched["DDIMScheduler"](
                 beta_start=0.00085,
                 beta_end=0.012,
                 beta_schedule="scaled_linear",
@@ -442,15 +458,16 @@ class ComfyUIModelWrapper:
             mode: "fast" for EulerDiscreteScheduler (turbo/LCM compatible),
                   "standard" to keep the auto-detected scheduler
         """
+        sched = _get_diffusers_schedulers()
         if mode == "fast":
-            self.scheduler = EulerDiscreteScheduler(
+            self.scheduler = sched["EulerDiscreteScheduler"](
                 beta_start=0.00085,
                 beta_end=0.012,
                 beta_schedule="scaled_linear",
                 timestep_spacing="trailing",
             )
         elif mode == "standard":
-            self.scheduler = DDIMScheduler(
+            self.scheduler = sched["DDIMScheduler"](
                 beta_start=0.00085,
                 beta_end=0.012,
                 beta_schedule="scaled_linear",
@@ -512,7 +529,8 @@ class ComfyUIInpaintRunner:
                 f"(e.g., sd-v1-5-inpainting)."
             )
 
-        self.scheduler = PNDMScheduler(
+        sched = _get_diffusers_schedulers()
+        self.scheduler = sched["PNDMScheduler"](
             beta_start=0.00085,
             beta_end=0.012,
             beta_schedule="scaled_linear",
